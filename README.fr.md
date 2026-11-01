@@ -13,9 +13,9 @@ Script Bash pour scanner des documents via SANE, les traiter avec ImageMagick et
 - **4 modes de traitement image** — nettoyage fond gris, noir et blanc pur, normalisation couleur, brut
 - **Formats papier** — A4, A5, Letter, Legal, personnalisé, ou détection automatique avec recadrage
 - **Résolution configurable** — 150 / 300 / 600 dpi ou valeur libre
-- **Scan multi-pages** — nombre fixe ou mode continu (page par page jusqu'à arrêt manuel)
+- **Scan multi-pages** — nombre fixe, mode continu (page par page jusqu'à arrêt manuel) ou chargeur automatique (ADF)
 - **Sortie PDF ou JPEG**
-- **Compression PDF** — via Ghostscript (preset automatique selon la résolution)
+- **Compression PDF** — via Ghostscript (preset automatique selon la résolution) ; en noir et blanc, compression CCITT Group4 sans perte, beaucoup plus légère
 - **OCR** — texte sélectionnable et copiable dans le PDF via ocrmypdf + Tesseract
 - **Suppression des métadonnées** — tout supprimer ou tout sauf les dates, pour PDF et JPEG
 - **Installation automatique des dépendances** manquantes en mode interactif
@@ -111,7 +111,9 @@ Le script guide étape par étape :
 | `-O <format>` | Format de sortie : `pdf` ou `jpeg` | `pdf` |
 | `-d <device>` | Identifiant SANE du scanner | auto-détection |
 | `-p` | Mode multi-pages | — |
-| `-n <nb>` | Nombre de pages (mode multi-pages) | `1` |
+| `-n <nb>` | Nombre de pages (active le mode multi-pages si > 1) | `1` |
+| `-a` | Chargeur automatique (ADF) : scanne tout le bac d'un coup | — |
+| `-S <source>` | Source SANE explicite (`ADF`, `ADF Duplex`, `Flatbed`…, voir `scanimage -A`) | auto-détectée avec `-a` |
 | `-R` | Activer l'OCR | — |
 | `-L <lang>` | Langue OCR (`fra`, `eng`, `fra+eng`…) | `fra+eng` |
 | `-M` | Supprimer toutes les métadonnées | — |
@@ -139,6 +141,9 @@ Le script guide étape par étape :
 
 # Scan 5 pages assemblées en un seul PDF
 ./scandoc.sh -p -n 5 -o dossier.pdf
+
+# Toutes les pages du chargeur automatique, en noir et blanc
+./scandoc.sh -a -m bw -o courrier.pdf
 
 # PDF avec OCR en français + suppression des métadonnées
 ./scandoc.sh -R -L fra -M -o document_ocr.pdf
