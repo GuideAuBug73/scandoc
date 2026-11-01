@@ -22,9 +22,11 @@
 set -euo pipefail
 
 # --- Couleurs terminal -------------------------------------------------------
-RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'; DIM='\033[2m'
-BLUE='\033[0;34m'
+# Syntaxe $'…' : les séquences d'échappement sont interprétées dès l'affectation,
+# ce qui permet de les utiliser aussi avec cat/printf (ex. : l'aide -h).
+RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; GREEN=$'\033[0;32m'
+CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'; DIM=$'\033[2m'
+BLUE=$'\033[0;34m'
 
 info()    { echo -e "${CYAN}[INFO]${RESET} $*"; }
 success() { echo -e "${GREEN}[OK]${RESET}  $*"; }
@@ -47,13 +49,12 @@ DEVICE=""               # Scanner SANE (auto-détecté si vide)
 MULTI_PAGE=false        # Scan multi-pages avec pause entre chaque page
 NB_PAGES=1              # Nombre de pages (mode multi-pages)
 MULTI_PAGE_MODE="fixed" # Mode multi-pages : fixed (nombre connu) | auto (continu jusqu'à stop)
-MERGED_PDF=""           # Chemin du PDF assemblé (rempli par do_multi_page)
 KEEP_TEMP=false         # Garder les fichiers temporaires (debug)
 COMPRESS=true           # Compresser le PDF final avec ghostscript
 DEPTH=8                 # Profondeur de couleur (8=standard, 16=haute fidélité)
 OUTPUT_FORMAT="pdf"     # Format de sortie : pdf | jpeg
 JPEG_QUALITY=85         # Qualité JPEG (1-100, 85=bon compromis qualité/taille)
-MULTI_PAGE_FILES=()     # Chemins des pages traitées en mode multi-pages JPEG
+PAGES=()                # Pages traitées, dans l'ordre (remplies avant la finalisation)
 OCR=false               # Activer l'OCR (texte sélectionnable) avec ocrmypdf
 OCR_LANG="fra+eng"      # Langue(s) OCR : fra, eng, deu, spa... (séparer par +)
 STRIP_META=false        # Métadonnées : false | all (tout supprimer) | nodates (tout sauf dates)
@@ -176,6 +177,19 @@ ask_choice() {
     fi
     warn "Choix invalide. Entrez un nombre entre 1 et $max."
   done
+}
+
+# _with_ext CHEMIN EXT — remplace l'extension pdf/jpg/jpeg du nom de fichier par EXT.
+# Seul le nom de base est examiné : « ./scans/facture » → « ./scans/facture.pdf »,
+# et une autre extension est conservée : « facture.2024 » → « facture.2024.pdf ».
+_with_ext() {
+  local path="$1" ext="$2"
+  local base="${path##*/}"
+  local cur="${base##*.}"
+  if [[ "$base" == *.* ]] && [[ "${cur,,}" =~ ^(pdf|jpg|jpeg)$ ]]; then
+    path="${path%.*}"
+  fi
+  echo "${path}.${ext}"
 }
 
 # =============================================================================
@@ -391,7 +405,7 @@ menu_output() {
   fi
   echo ""
   ask "Nom du fichier (.${ext})" "$default_name"
-  OUTPUT="${REPLY%.*}.${ext}"
+  OUTPUT=$(_with_ext "$REPLY" "$ext")
   success "Format : ${OUTPUT_FORMAT^^}  —  Sortie : $OUTPUT"
 }
 
@@ -483,6 +497,7 @@ run_interactive() {
   read -r _adv
   if [[ "${_adv,,}" == "o" ]]; then menu_advanced; fi
 
+  normalize_paper_format
   menu_summary
   main_process
 }
@@ -590,6 +605,27 @@ _paper_size_opts() {
   return 0
 }
 
+# Normalise PAPER_FORMAT (casse, « 210x297 » → « custom:210x297 ») et refuse
+# les valeurs inconnues, avant tout scan.
+normalize_paper_format() {
+  local f="$PAPER_FORMAT"
+  f="${f#custom:}"
+  case "${f,,}" in
+    auto)   PAPER_FORMAT="auto" ;;
+    a4)     PAPER_FORMAT="A4" ;;
+    a5)     PAPER_FORMAT="A5" ;;
+    letter) PAPER_FORMAT="Letter" ;;
+    legal)  PAPER_FORMAT="Legal" ;;
+    *)
+      if [[ "${f,,}" =~ ^[0-9]+([.][0-9]+)?x[0-9]+([.][0-9]+)?$ ]]; then
+        PAPER_FORMAT="custom:${f,,}"
+      else
+        error "Format papier invalide : ${PAPER_FORMAT}\n  → Valeurs possibles : auto, A4, A5, Letter, Legal, ou LxH en mm (ex : 210x297)"
+      fi
+      ;;
+  esac
+}
+
 do_scan() {
   local outfile="$1"
   local device_opt=""
@@ -686,6 +722,17 @@ do_process() {
       error "Mode inconnu : ${MODE}. Valeurs valides : scan | clean | bw | color"
       ;;
   esac
+
+  # Résolution : sans elle, ImageMagick suppose 72 dpi et la page du PDF
+  # devient gigantesque (A4 à 300 dpi → 87 × 124 cm). Le PNM (scan, PDF source)
+  # ne porte aucune résolution ; pour une image, on garde la sienne si elle existe.
+  local units=""
+  if [[ "$infile" != *.pnm ]]; then
+    units=$(identify -format '%U' "${infile}[0]" 2>/dev/null || true)
+  fi
+  if [[ -z "$units" ]] || [[ "$units" == "Undefined" ]]; then
+    im_args+=("-units" "PixelsPerInch" "-density" "$RESOLUTION")
+  fi
 
   # Qualité JPEG si applicable
   if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
@@ -1014,56 +1061,50 @@ do_compress() {
 #  SCAN MULTI-PAGES
 # =============================================================================
 
+# Extension des pages traitées : JPEG en sortie JPEG ; sinon MIFF, format
+# interne sans perte qui conserve la résolution, assemblé ensuite en un seul
+# PDF (assembler des PDF avec convert les re-rastériserait à 72 dpi).
+_page_ext() {
+  if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then echo "jpg"; else echo "miff"; fi
+}
+
+# Scanne puis traite une page ; ajoute le résultat à PAGES
+_scan_page() {
+  local tmpdir="$1" num="$2"
+  local scan_tmp="${tmpdir}/page_${num}.pnm"
+  local proc_tmp="${tmpdir}/page_${num}_processed.$(_page_ext)"
+  do_scan "$scan_tmp"
+  do_process "$scan_tmp" "$proc_tmp"
+  PAGES+=("$proc_tmp")
+}
+
 do_multi_page() {
   local tmpdir="$1"
-  local pages=()
   local page_num=0
-  local proc_ext; if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then proc_ext="jpg"; else proc_ext="pdf"; fi
 
   if [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
     while true; do
       page_num=$(( page_num + 1 ))
       echo ""
       echo -e "${BOLD}--- Page ${page_num} ---${RESET}"
-      local scan_tmp="${tmpdir}/page_${page_num}.pnm"
-      local proc_tmp="${tmpdir}/page_${page_num}_processed.${proc_ext}"
+      _scan_page "$tmpdir" "$page_num"
 
-      do_scan "$scan_tmp"
-      do_process "$scan_tmp" "$proc_tmp"
-      pages+=("$proc_tmp")
-
-      echo -ne "\n  ${BOLD}→${RESET} Scanner une autre page ? ${DIM}[O/n]${RESET} : "
+      echo -e "\n  ${DIM}Pour continuer, placez la page suivante dans le scanner avant de répondre.${RESET}"
+      echo -ne "  ${BOLD}→${RESET} Scanner une autre page ? ${DIM}[O/n]${RESET} : "
       read -r _more
       if [[ "${_more,,}" == "n" ]]; then break; fi
-      echo -e "  ${DIM}Placez la page suivante dans le scanner, puis appuyez sur Entrée pour continuer...${RESET}"
     done
   else
     for (( i=1; i<=NB_PAGES; i++ )); do
       echo ""
       echo -e "${BOLD}--- Page ${i}/${NB_PAGES} ---${RESET}"
-      local scan_tmp="${tmpdir}/page_${i}.pnm"
-      local proc_tmp="${tmpdir}/page_${i}_processed.${proc_ext}"
-
-      do_scan "$scan_tmp"
-      do_process "$scan_tmp" "$proc_tmp"
-      pages+=("$proc_tmp")
+      _scan_page "$tmpdir" "$i"
 
       if [[ $i -lt $NB_PAGES ]]; then
         echo -e "\n  ${YELLOW}Placez la page suivante dans le scanner, puis appuyez sur ENTRÉE...${RESET}"
         read -r
       fi
     done
-    page_num=$NB_PAGES
-  fi
-
-  if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
-    MULTI_PAGE_FILES=("${pages[@]}")
-    MERGED_PDF=""
-  else
-    info "Assemblage des ${page_num} pages..."
-    convert "${pages[@]}" "${tmpdir}/merged.pdf" \
-      || error "Échec de l'assemblage des pages"
-    MERGED_PDF="${tmpdir}/merged.pdf"
   fi
 }
 
@@ -1076,115 +1117,116 @@ main_process() {
   local ext; if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then ext="jpg"; else ext="pdf"; fi
 
   if [[ -z "$OUTPUT" ]]; then OUTPUT="scan_$(date +%Y%m%d_%H%M%S).${ext}"; fi
-  OUTPUT="${OUTPUT%.*}.${ext}"
+  OUTPUT=$(_with_ext "$OUTPUT" "$ext")
 
   SCAN_TMPDIR=$(mktemp -d /tmp/scan-doc-XXXXXX)
   local tmpdir="$SCAN_TMPDIR"
   if $KEEP_TEMP; then info "Fichiers temporaires dans : $tmpdir"; fi
   if ! $KEEP_TEMP; then trap 'rm -rf "$SCAN_TMPDIR"' EXIT; fi
 
-  local source_file
+  PAGES=()
 
-  # --- Étape 1 : Source (scan ou fichier existant) --------------------------
+  # --- Étapes 1 et 2 : source (scan ou fichier existant) + post-traitement ---
   if [[ -n "$INPUT_FILE" ]]; then
     [[ -f "$INPUT_FILE" ]] || error "Fichier introuvable : $INPUT_FILE"
     info "Source : $INPUT_FILE"
 
-    if [[ "$INPUT_FILE" == *.pdf ]] || [[ "$INPUT_FILE" == *.PDF ]]; then
+    local sources=()
+    if [[ "${INPUT_FILE,,}" == *.pdf ]]; then
       info "Conversion PDF → PNM (${RESOLUTION} dpi, ${DEPTH}-bit)..."
-      convert -density "$RESOLUTION" -depth "$DEPTH" "$INPUT_FILE" "${tmpdir}/source.pnm" \
+      # %03d : une image par page, numérotée dans l'ordre
+      convert -density "$RESOLUTION" -depth "$DEPTH" "$INPUT_FILE" "${tmpdir}/source-%03d.pnm" \
         || error "Échec de la conversion PDF"
-      source_file="${tmpdir}/source.pnm"
+      sources=("${tmpdir}"/source-*.pnm)
+      [[ -f "${sources[0]}" ]] || error "Aucune page extraite de : $INPUT_FILE"
+      if [[ ${#sources[@]} -gt 1 ]]; then info "${#sources[@]} pages détectées."; fi
     else
-      source_file="$INPUT_FILE"
+      sources=("$INPUT_FILE")
     fi
+
+    local n=0 src
+    for src in "${sources[@]}"; do
+      n=$(( n + 1 ))
+      local proc_tmp="${tmpdir}/page_${n}_processed.$(_page_ext)"
+      do_process "$src" "$proc_tmp"
+      PAGES+=("$proc_tmp")
+    done
 
   elif $MULTI_PAGE; then
-    MERGED_PDF=""; MULTI_PAGE_FILES=()
     do_multi_page "$tmpdir"
-    if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
-      local base="${OUTPUT%.jpg}"
-      local total="${#MULTI_PAGE_FILES[@]}"
-      local idx=1
-      for f in "${MULTI_PAGE_FILES[@]}"; do
-        local dest
-        printf -v dest "%s_%03d.jpg" "$base" "$idx"
-        cp "$f" "$dest"
-        if [[ "$STRIP_META" != "false" ]]; then
-          local stripped_jpg="${tmpdir}/stripped_${idx}.jpg"
-          do_strip_meta "$dest" "$stripped_jpg"
-          mv "$stripped_jpg" "$dest"
-        fi
-        success "Page ${idx} → ${dest}"
-        idx=$(( idx + 1 ))
-      done
-      local last; printf -v last "%s_%03d.jpg" "$base" "$total"
-      echo ""
-      echo -e "${GREEN}${BOLD}✓ Terminé !${RESET}"
-      echo -e "  ${total} fichier(s) JPEG : ${BOLD}${base}_001.jpg${RESET} … ${BOLD}${last}${RESET}"
-      echo ""
-    else
-      local pre_ocr
-      if $OCR; then
-        pre_ocr="${tmpdir}/pre_ocr.pdf"
-        if $COMPRESS; then
-          do_compress "$MERGED_PDF" "$pre_ocr"
-        else
-          cp "$MERGED_PDF" "$pre_ocr"
-        fi
-        do_ocr "$pre_ocr" "$OUTPUT"
-      elif $COMPRESS; then
-        do_compress "$MERGED_PDF" "$OUTPUT"
-      else
-        cp "$MERGED_PDF" "$OUTPUT"
-      fi
-      if [[ "$STRIP_META" != "false" ]]; then
-        local pre_strip_mp="${tmpdir}/pre_strip_mp.pdf"
-        mv "$OUTPUT" "$pre_strip_mp"
-        do_strip_meta "$pre_strip_mp" "$OUTPUT"
-      fi
-      _print_done
-    fi
-    return
 
   else
-    source_file="${tmpdir}/scan_raw.pnm"
-    do_scan "$source_file"
+    _scan_page "$tmpdir" 1
   fi
-
-  # --- Étape 2 : Post-traitement --------------------------------------------
-  local processed_out="${tmpdir}/processed.${ext}"
-  do_process "$source_file" "$processed_out"
 
   # --- Étape 3 : Finalisation -----------------------------------------------
   if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
-    cp "$processed_out" "$OUTPUT"
-    if [[ "$STRIP_META" != "false" ]]; then
-      local stripped_jpg="${tmpdir}/stripped.jpg"
-      do_strip_meta "$OUTPUT" "$stripped_jpg"
-      mv "$stripped_jpg" "$OUTPUT"
-    fi
-  elif $OCR; then
+    _finalize_jpeg "$tmpdir"
+    return
+  fi
+
+  info "Création du PDF (${#PAGES[@]} page(s))..."
+  local merged="${tmpdir}/merged.pdf"
+  convert "${PAGES[@]}" "$merged" || error "Échec de la création du PDF"
+
+  if $OCR; then
     local pre_ocr="${tmpdir}/pre_ocr.pdf"
     if $COMPRESS; then
-      do_compress "$processed_out" "$pre_ocr"
+      do_compress "$merged" "$pre_ocr"
     else
-      cp "$processed_out" "$pre_ocr"
+      cp "$merged" "$pre_ocr"
     fi
     do_ocr "$pre_ocr" "$OUTPUT"
   elif $COMPRESS; then
-    do_compress "$processed_out" "$OUTPUT"
+    do_compress "$merged" "$OUTPUT"
   else
-    cp "$processed_out" "$OUTPUT"
+    cp "$merged" "$OUTPUT"
   fi
 
-  if [[ "$OUTPUT_FORMAT" == "pdf" ]] && [[ "$STRIP_META" != "false" ]]; then
+  if [[ "$STRIP_META" != "false" ]]; then
     local pre_strip="${tmpdir}/pre_strip.pdf"
     mv "$OUTPUT" "$pre_strip"
     do_strip_meta "$pre_strip" "$OUTPUT"
   fi
 
   _print_done
+}
+
+# Sortie JPEG : un fichier pour une page, nom_001.jpg, nom_002.jpg… sinon
+_finalize_jpeg() {
+  local tmpdir="$1"
+  local total="${#PAGES[@]}"
+
+  if [[ $total -eq 1 ]]; then
+    cp "${PAGES[0]}" "$OUTPUT"
+    if [[ "$STRIP_META" != "false" ]]; then
+      local stripped_jpg="${tmpdir}/stripped.jpg"
+      do_strip_meta "$OUTPUT" "$stripped_jpg"
+      mv "$stripped_jpg" "$OUTPUT"
+    fi
+    _print_done
+    return
+  fi
+
+  local base="${OUTPUT%.jpg}"
+  local idx=1 f
+  for f in "${PAGES[@]}"; do
+    local dest
+    printf -v dest "%s_%03d.jpg" "$base" "$idx"
+    cp "$f" "$dest"
+    if [[ "$STRIP_META" != "false" ]]; then
+      local stripped_jpg="${tmpdir}/stripped_${idx}.jpg"
+      do_strip_meta "$dest" "$stripped_jpg"
+      mv "$stripped_jpg" "$dest"
+    fi
+    success "Page ${idx} → ${dest}"
+    idx=$(( idx + 1 ))
+  done
+  local last; printf -v last "%s_%03d.jpg" "$base" "$total"
+  echo ""
+  echo -e "${GREEN}${BOLD}✓ Terminé !${RESET}"
+  echo -e "  ${total} fichier(s) JPEG : ${BOLD}${base}_001.jpg${RESET} … ${BOLD}${last}${RESET}"
+  echo ""
 }
 
 _print_done() {
@@ -1205,6 +1247,7 @@ if [[ $# -eq 0 ]]; then
   run_interactive
 else
   # Arguments CLI → mode direct (comportement d'origine)
+  normalize_paper_format
   check_deps
   main_process
 fi
