@@ -13,9 +13,9 @@ A Bash script to scan documents via SANE, process them with ImageMagick and expo
 - **4 image processing modes** — grey background cleanup, pure black & white, colour normalisation, raw
 - **Paper formats** — A4, A5, Letter, Legal, custom, or auto-detection with automatic cropping
 - **Configurable resolution** — 150 / 300 / 600 dpi or custom value
-- **Multi-page scan** — fixed page count or continuous mode (page by page until manually stopped)
+- **Multi-page scan** — fixed page count, continuous mode (page by page until manually stopped) or automatic document feeder (ADF)
 - **PDF or JPEG output**
-- **PDF compression** — via Ghostscript (preset selected automatically based on resolution)
+- **PDF compression** — via Ghostscript (preset selected automatically based on resolution); black & white uses lossless CCITT Group4, much smaller
 - **OCR** — selectable and copyable text layer in PDF via ocrmypdf + Tesseract
 - **Metadata removal** — strip everything or everything except dates, for both PDF and JPEG
 - **Automatic dependency installation** — missing packages offered for install in interactive mode
@@ -111,7 +111,9 @@ The script guides you step by step:
 | `-O <format>` | Output format: `pdf` or `jpeg` | `pdf` |
 | `-d <device>` | SANE scanner device ID | auto-detect |
 | `-p` | Multi-page mode | — |
-| `-n <nb>` | Number of pages (multi-page mode) | `1` |
+| `-n <nb>` | Number of pages (enables multi-page mode if > 1) | `1` |
+| `-a` | Automatic document feeder (ADF): scan the whole tray at once | — |
+| `-S <source>` | Explicit SANE source (`ADF`, `ADF Duplex`, `Flatbed`…, see `scanimage -A`) | auto-detected with `-a` |
 | `-R` | Enable OCR | — |
 | `-L <lang>` | OCR language (`fra`, `eng`, `fra+eng`…) | `fra+eng` |
 | `-M` | Strip all metadata | — |
@@ -139,6 +141,9 @@ The script guides you step by step:
 
 # Scan 5 pages assembled into a single PDF
 ./scandoc.sh -p -n 5 -o document.pdf
+
+# Every page in the automatic document feeder, black & white
+./scandoc.sh -a -m bw -o letter.pdf
 
 # PDF with French OCR and metadata stripped
 ./scandoc.sh -R -L fra -M -o document_ocr.pdf

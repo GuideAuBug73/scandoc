@@ -48,7 +48,8 @@ BLUR=0                  # Rayon de flou avant traitement (0=désactivé)
 DEVICE=""               # Scanner SANE (auto-détecté si vide)
 MULTI_PAGE=false        # Scan multi-pages avec pause entre chaque page
 NB_PAGES=1              # Nombre de pages (mode multi-pages)
-MULTI_PAGE_MODE="fixed" # Mode multi-pages : fixed (nombre connu) | auto (continu jusqu'à stop)
+MULTI_PAGE_MODE="fixed" # Mode multi-pages : fixed (nombre connu) | auto (continu jusqu'à stop) | adf (chargeur)
+SCAN_SOURCE=""          # Source SANE (ex : "ADF", "Flatbed") — auto-détectée en mode adf si vide
 KEEP_TEMP=false         # Garder les fichiers temporaires (debug)
 COMPRESS=true           # Compresser le PDF final avec ghostscript
 DEPTH=8                 # Profondeur de couleur (8=standard, 16=haute fidélité)
@@ -179,6 +180,19 @@ ask_choice() {
   done
 }
 
+# Invite nombre entier borné, redemandé tant que la saisie est invalide — résultat dans $REPLY
+ask_int() {
+  local prompt="$1" default="$2" min="$3" max="$4"
+  while true; do
+    ask "$prompt" "$default"
+    if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( 10#$REPLY >= min && 10#$REPLY <= max )); then
+      REPLY=$(( 10#$REPLY ))
+      return 0
+    fi
+    warn "Valeur invalide. Entrez un nombre entre $min et $max."
+  done
+}
+
 # _with_ext CHEMIN EXT — remplace l'extension pdf/jpg/jpeg du nom de fichier par EXT.
 # Seul le nom de base est examiné : « ./scans/facture » → « ./scans/facture.pdf »,
 # et une autre extension est conservée : « facture.2024 » → « facture.2024.pdf ».
@@ -277,8 +291,7 @@ menu_resolution() {
     2) RESOLUTION=300 ;;
     3) RESOLUTION=600 ;;
     4)
-      ask "Résolution en dpi" "300"
-      [[ "$REPLY" =~ ^[0-9]+$ ]] || error "Valeur invalide : $REPLY"
+      ask_int "Résolution en dpi (50-4800)" "300" 50 4800
       RESOLUTION="$REPLY"
       ;;
   esac
@@ -310,20 +323,21 @@ menu_multipage() {
   echo ""
   print_opt "1" "Nombre fixe de pages"          "Vous savez combien de pages scanner"          "true"
   print_opt "2" "Mode continu (sans compter)"    "Scan page par page — vous décidez quand arrêter"
-  ask_choice "Votre choix" "1" "2"
+  print_opt "3" "Chargeur automatique (ADF)"     "Toutes les pages du bac d'un coup, sans intervention"
+  ask_choice "Votre choix" "1" "3"
 
   if [[ "$REPLY" == "1" ]]; then
     MULTI_PAGE_MODE="fixed"
     echo ""
-    ask "Nombre de pages à scanner" "$NB_PAGES"
-    if [[ ! "$REPLY" =~ ^[0-9]+$ ]] || [[ "$REPLY" -lt 1 ]]; then
-      error "Nombre de pages invalide : $REPLY"
-    fi
+    ask_int "Nombre de pages à scanner" "$NB_PAGES" 1 999
     NB_PAGES="$REPLY"
     success "$NB_PAGES page(s) configurée(s)."
-  else
+  elif [[ "$REPLY" == "2" ]]; then
     MULTI_PAGE_MODE="auto"
     success "Mode continu : vous serez invité après chaque page."
+  else
+    MULTI_PAGE_MODE="adf"
+    success "Chargeur automatique : placez toutes les pages dans le bac."
   fi
 }
 
@@ -337,7 +351,7 @@ menu_advanced() {
       echo -e "  ${BOLD}Seuil de blanchiment${RESET}  ${DIM}(mode clean)${RESET}"
       echo -e "  ${DIM}Les pixels plus clairs que ce seuil sont forcés en blanc pur.${RESET}"
       echo -e "  ${DIM}  ↑ Monter si le fond gris persiste   ↓ Descendre si les couleurs s'effacent${RESET}"
-      ask "Seuil (0-100)" "$WHITE_THRESH"
+      ask_int "Seuil (0-100)" "$WHITE_THRESH" 0 100
       WHITE_THRESH="$REPLY"
       echo ""
       ;;
@@ -345,13 +359,13 @@ menu_advanced() {
       echo -e "  ${BOLD}Seuil de binarisation${RESET}  ${DIM}(mode bw)${RESET}"
       echo -e "  ${DIM}En dessous de ce seuil → noir pur. Au-dessus → blanc pur.${RESET}"
       echo -e "  ${DIM}  ↑ Monter si le fond gris persiste   ↓ Descendre si le texte disparaît${RESET}"
-      ask "Seuil (0-100)" "$THRESHOLD"
+      ask_int "Seuil (0-100)" "$THRESHOLD" 0 100
       THRESHOLD="$REPLY"
       echo ""
       echo -e "  ${BOLD}Flou anti-bruit${RESET}"
       echo -e "  ${DIM}Lisse légèrement l'image avant la binarisation pour réduire le grain.${RESET}"
       echo -e "  ${DIM}  0 = désactivé   1 = léger   2 = moyen (recommandé pour vieux documents)${RESET}"
-      ask "Rayon de flou (0-3)" "$BLUR"
+      ask_int "Rayon de flou (0-3)" "$BLUR" 0 3
       BLUR="$REPLY"
       echo ""
       ;;
@@ -374,12 +388,8 @@ menu_advanced() {
     echo -e "  ${DIM}Plus la valeur est haute, meilleure est la qualité — mais le fichier est plus lourd.${RESET}"
     echo -e "  ${DIM}  75 = léger   85 = bon compromis   95 = haute fidélité${RESET}"
     echo ""
-    ask "Qualité (1-100)" "$JPEG_QUALITY"
-    if [[ "$REPLY" =~ ^[0-9]+$ ]] && [[ "$REPLY" -ge 1 ]] && [[ "$REPLY" -le 100 ]]; then
-      JPEG_QUALITY="$REPLY"
-    else
-      warn "Valeur invalide, qualité conservée à ${JPEG_QUALITY}."
-    fi
+    ask_int "Qualité (1-100)" "$JPEG_QUALITY" 1 100
+    JPEG_QUALITY="$REPLY"
   fi
 
   success "Options avancées appliquées."
@@ -417,6 +427,8 @@ menu_summary() {
   if $MULTI_PAGE; then
     if [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "mode continu (au fil de l'eau)"
+    elif [[ "$MULTI_PAGE_MODE" == "adf" ]]; then
+      printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "chargeur automatique${SCAN_SOURCE:+ ($SCAN_SOURCE)}"
     else
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "$NB_PAGES"
     fi
@@ -497,7 +509,7 @@ run_interactive() {
   read -r _adv
   if [[ "${_adv,,}" == "o" ]]; then menu_advanced; fi
 
-  normalize_paper_format
+  validate_options
   menu_summary
   main_process
 }
@@ -532,6 +544,8 @@ ${BOLD}OPTIONS${RESET}
   -M             Supprimer toutes les métadonnées (PDF et JPEG : outils, dates…)
   -p             Mode multi-pages (pause entre chaque page)
   -n <nb>        Nombre de pages en mode multi-pages (défaut: ${NB_PAGES})
+  -a             Chargeur automatique (ADF) : scanne toutes les pages du bac
+  -S <source>    Source SANE explicite (ex: "ADF Duplex", "Flatbed") — voir -l
   -k             Garder les fichiers temporaires
   -C             Désactiver la compression ghostscript
   -l             Lister les scanners disponibles
@@ -542,6 +556,7 @@ ${BOLD}EXEMPLES${RESET}
   $(basename "$0") -r 600 -m color -o photo.pdf
   $(basename "$0") -f scan_existant.jpg -m bw -t 60
   $(basename "$0") -p -n 5 -o dossier_complet.pdf
+  $(basename "$0") -a -m bw -o courrier.pdf
 EOF
   exit 0
 }
@@ -556,7 +571,7 @@ list_devices() {
 #  PARSING DES OPTIONS (mode CLI)
 # =============================================================================
 
-while getopts "r:m:o:f:t:w:b:d:F:O:L:n:pkCRMlh" opt; do
+while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkCRMlh" opt; do
   case $opt in
     r) RESOLUTION="$OPTARG" ;;
     m) MODE="$OPTARG" ;;
@@ -571,6 +586,8 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:pkCRMlh" opt; do
     L) OCR_LANG="$OPTARG" ;;
     n) NB_PAGES="$OPTARG" ;;
     p) MULTI_PAGE=true ;;
+    a) MULTI_PAGE=true; MULTI_PAGE_MODE="adf" ;;
+    S) SCAN_SOURCE="$OPTARG" ;;
     k) KEEP_TEMP=true ;;
     C) COMPRESS=false ;;
     R) OCR=true ;;
@@ -580,6 +597,70 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:pkCRMlh" opt; do
     *) usage ;;
   esac
 done
+
+# =============================================================================
+#  VALIDATION DES OPTIONS (avant tout scan)
+# =============================================================================
+
+# _check_int NOM VALEUR MIN MAX — erreur si VALEUR n'est pas un entier dans [MIN, MAX]
+_check_int() {
+  local name="$1" val="$2" min="$3" max="$4"
+  if [[ ! "$val" =~ ^[0-9]+$ ]] || (( 10#$val < min || 10#$val > max )); then
+    error "${name} invalide : « ${val} » — attendu un entier entre ${min} et ${max}."
+  fi
+}
+
+# Normalise et vérifie toutes les options, pour échouer tout de suite plutôt
+# qu'après un scan.
+validate_options() {
+  MODE="${MODE,,}"
+  case "$MODE" in
+    scan|clean|bw|color) ;;
+    *) error "Mode invalide : « ${MODE} » — valeurs possibles : scan, clean, bw, color." ;;
+  esac
+
+  OUTPUT_FORMAT="${OUTPUT_FORMAT,,}"
+  case "$OUTPUT_FORMAT" in
+    pdf) ;;
+    jpeg|jpg) OUTPUT_FORMAT="jpeg" ;;
+    *) error "Format de sortie invalide : « ${OUTPUT_FORMAT} » — valeurs possibles : pdf, jpeg (ou jpg)." ;;
+  esac
+
+  _check_int "Résolution (-r)"          "$RESOLUTION"   50 4800
+  _check_int "Nombre de pages (-n)"     "$NB_PAGES"     1  999
+  _check_int "Seuil bw (-t)"            "$THRESHOLD"    0  100
+  _check_int "Seuil de blanchiment (-w)" "$WHITE_THRESH" 0  100
+  _check_int "Flou (-b)"                "$BLUR"         0  3
+  _check_int "Qualité JPEG"             "$JPEG_QUALITY" 1  100
+  RESOLUTION=$((10#$RESOLUTION)); NB_PAGES=$((10#$NB_PAGES))
+  THRESHOLD=$((10#$THRESHOLD)); WHITE_THRESH=$((10#$WHITE_THRESH))
+  BLUR=$((10#$BLUR)); JPEG_QUALITY=$((10#$JPEG_QUALITY))
+
+  if [[ ! "$OCR_LANG" =~ ^[a-z_]+(\+[a-z_]+)*$ ]]; then
+    error "Langue OCR invalide : « ${OCR_LANG} » — ex : fra, eng, fra+eng."
+  fi
+
+  normalize_paper_format
+
+  if [[ -n "$INPUT_FILE" ]]; then
+    [[ -f "$INPUT_FILE" ]] || error "Fichier introuvable : $INPUT_FILE"
+    if $MULTI_PAGE; then warn "-f fourni : le mode multi-pages / chargeur est ignoré."; fi
+  fi
+  if [[ -n "$OUTPUT" ]]; then
+    local out_dir; out_dir=$(dirname -- "$OUTPUT")
+    [[ -d "$out_dir" ]] || error "Dossier de sortie introuvable : ${out_dir}"
+    [[ -w "$out_dir" ]] || error "Dossier de sortie non accessible en écriture : ${out_dir}"
+  fi
+  # -n sans -p : on suppose que plusieurs pages sont voulues
+  if [[ -z "$INPUT_FILE" ]] && ! $MULTI_PAGE && (( NB_PAGES > 1 )); then
+    info "-n ${NB_PAGES} sans -p : mode multi-pages activé."
+    MULTI_PAGE=true
+  fi
+  if $OCR && [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
+    warn "L'OCR ne s'applique qu'au PDF : ignoré pour une sortie JPEG."
+    OCR=false
+  fi
+}
 
 # =============================================================================
 #  SCAN
@@ -626,34 +707,45 @@ normalize_paper_format() {
   esac
 }
 
-do_scan() {
-  local outfile="$1"
-  local device_opt=""
-  if [[ -n "$DEVICE" ]]; then device_opt="--device-name=$DEVICE"; fi
-
-  # Mode couleur scanimage selon le mode de traitement
-  local scan_mode_opt
+# Options scanimage communes au scan simple et au chargeur : scanner, source,
+# mode couleur, zone de scan, format et résolution — résultat dans SCAN_OPTS
+_scan_opts() {
+  SCAN_OPTS=()
+  if [[ -n "$DEVICE" ]]; then SCAN_OPTS+=("--device-name=$DEVICE"); fi
+  if [[ -n "$SCAN_SOURCE" ]]; then SCAN_OPTS+=("--source=$SCAN_SOURCE"); fi
   case "$MODE" in
-    bw) scan_mode_opt="--mode=Gray" ;;
-    *)  scan_mode_opt="--mode=Color" ;;
+    bw) SCAN_OPTS+=("--mode=Gray") ;;
+    *)  SCAN_OPTS+=("--mode=Color") ;;
   esac
-
-  # Dimensions de la zone de scan
   local size_opts
   size_opts=$(_paper_size_opts)
+  # shellcheck disable=SC2206
+  SCAN_OPTS+=($size_opts "--format=pnm" "--resolution=$RESOLUTION")
+}
+
+# En mode auto : recadrage automatique des bandes noires/vides en bordure
+_auto_trim() {
+  local file="$1"
+  [[ "$PAPER_FORMAT" == "auto" ]] || return 0
+  local trimmed
+  trimmed=$(mktemp --suffix=.pnm)
+  if convert "$file" -fuzz 8% -trim +repage "$trimmed" 2>/dev/null; then
+    mv "$trimmed" "$file"
+  else
+    rm -f "$trimmed"
+    warn "Recadrage automatique échoué, image conservée telle quelle."
+  fi
+}
+
+do_scan() {
+  local outfile="$1"
+  _scan_opts
 
   info "Scan en cours (${RESOLUTION} dpi, format ${PAPER_FORMAT}, mode ${MODE})..."
 
   local scan_err
   scan_err=$(mktemp)
-  # shellcheck disable=SC2086
-  if ! scanimage \
-      $device_opt \
-      $scan_mode_opt \
-      $size_opts \
-      --format="pnm" \
-      --resolution="$RESOLUTION" \
-      > "$outfile" 2>"$scan_err"; then
+  if ! scanimage "${SCAN_OPTS[@]}" > "$outfile" 2>"$scan_err"; then
     local msg
     msg=$(cat "$scan_err")
     rm -f "$scan_err"
@@ -661,21 +753,83 @@ do_scan() {
   fi
   rm -f "$scan_err"
 
-  # En mode auto : recadrage automatique des bandes noires/vides en bordure
   if [[ "$PAPER_FORMAT" == "auto" ]]; then
     info "Recadrage automatique des bords..."
-    local trimmed
-    trimmed=$(mktemp --suffix=.pnm)
-    if convert "$outfile" -fuzz 8% -trim +repage "$trimmed" 2>/dev/null; then
-      mv "$trimmed" "$outfile"
-      success "Recadrage effectué."
-    else
-      rm -f "$trimmed"
-      warn "Recadrage automatique échoué, image conservée telle quelle."
-    fi
+    _auto_trim "$outfile"
   fi
 
   success "Scan terminé → $outfile"
+}
+
+# Cherche dans les options du scanner une source de type chargeur (ADF / Feeder).
+# Privilégie le recto simple ; affiche la source trouvée, rien sinon.
+_detect_adf_source() {
+  local dev_opts=()
+  if [[ -n "$DEVICE" ]]; then dev_opts+=("--device-name=$DEVICE"); fi
+  local line
+  line=$(scanimage "${dev_opts[@]}" -A 2>/dev/null | grep -m1 -E '^[[:space:]]*--source' || true)
+  [[ -n "$line" ]] || return 0
+  # Ex : "    --source Flatbed|ADF|ADF Duplex [Flatbed]"
+  line="${line#*--source }"
+  line="${line%% \[*}"
+  local IFS='|' src candidates=()
+  read -ra candidates <<< "$line"
+  for src in "${candidates[@]}"; do
+    if [[ "${src,,}" =~ (adf|feeder) ]] && [[ ! "${src,,}" =~ duplex ]]; then echo "$src"; return 0; fi
+  done
+  for src in "${candidates[@]}"; do
+    if [[ "${src,,}" =~ (adf|feeder) ]]; then echo "$src"; return 0; fi
+  done
+}
+
+# Scan de tout le bac du chargeur en une seule commande (scanimage --batch).
+# Remplit PAGES avec les pages traitées.
+do_scan_adf() {
+  local tmpdir="$1"
+
+  if [[ -z "$SCAN_SOURCE" ]]; then
+    SCAN_SOURCE=$(_detect_adf_source)
+    if [[ -n "$SCAN_SOURCE" ]]; then
+      info "Source chargeur détectée : ${SCAN_SOURCE}"
+    else
+      warn "Aucune source « ADF » détectée : le scanner utilisera sa source par défaut."
+      echo -e "    ${DIM}Pour la forcer : -S \"<source>\" (voir « scanimage -A »).${RESET}"
+    fi
+  fi
+  _scan_opts
+
+  info "Scan du chargeur en cours (${RESOLUTION} dpi, format ${PAPER_FORMAT}, mode ${MODE})..."
+  local scan_err
+  scan_err=$(mktemp)
+  # Le code retour de scanimage n'est pas fiable en mode batch (« plus de
+  # documents » en fin de bac) : on juge sur les pages réellement produites.
+  scanimage "${SCAN_OPTS[@]}" --batch="${tmpdir}/adf_%03d.pnm" 2>"$scan_err" || true
+
+  local raw=()
+  shopt -s nullglob
+  raw=("${tmpdir}"/adf_*.pnm)
+  shopt -u nullglob
+  # Une page vide (0 octet) peut être laissée par un bourrage ou un bac vide
+  local f pages_ok=()
+  for f in "${raw[@]}"; do [[ -s "$f" ]] && pages_ok+=("$f"); done
+
+  if [[ ${#pages_ok[@]} -eq 0 ]]; then
+    local msg; msg=$(grep -v '^Scanning\|^Scanned' "$scan_err" || true)
+    rm -f "$scan_err"
+    error "Aucune page scannée depuis le chargeur : ${msg:-erreur inconnue}\n  → Vérifiez que les pages sont dans le bac et que le scanner a un chargeur (-S pour choisir la source)."
+  fi
+  rm -f "$scan_err"
+  success "${#pages_ok[@]} page(s) scannée(s) depuis le chargeur."
+
+  local n=0
+  for f in "${pages_ok[@]}"; do
+    n=$(( n + 1 ))
+    echo -e "${BOLD}--- Page ${n}/${#pages_ok[@]} ---${RESET}"
+    _auto_trim "$f"
+    local proc_tmp="${tmpdir}/page_${n}_processed.$(_page_ext)"
+    do_process "$f" "$proc_tmp"
+    PAGES+=("$proc_tmp")
+  done
 }
 
 # =============================================================================
@@ -1082,7 +1236,9 @@ do_multi_page() {
   local tmpdir="$1"
   local page_num=0
 
-  if [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
+  if [[ "$MULTI_PAGE_MODE" == "adf" ]]; then
+    do_scan_adf "$tmpdir"
+  elif [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
     while true; do
       page_num=$(( page_num + 1 ))
       echo ""
@@ -1167,17 +1323,31 @@ main_process() {
 
   info "Création du PDF (${#PAGES[@]} page(s))..."
   local merged="${tmpdir}/merged.pdf"
-  convert "${PAGES[@]}" "$merged" || error "Échec de la création du PDF"
+  local pdf_args=()
+  if [[ "$MODE" == "bw" ]]; then
+    # Image 1 bit compressée en CCITT Group4 (format fax) : PDF noir et
+    # blanc bien plus léger, sans perte
+    pdf_args=("-type" "bilevel" "-compress" "Group4")
+  fi
+  convert "${PAGES[@]}" "${pdf_args[@]}" "$merged" || error "Échec de la création du PDF"
+
+  # Le noir et blanc est déjà en Group4 : Ghostscript ne ferait que le ré-encoder
+  # en plus gros
+  local compress=$COMPRESS
+  if $compress && [[ "$MODE" == "bw" ]]; then
+    info "Noir et blanc déjà compressé en Group4 : compression Ghostscript inutile."
+    compress=false
+  fi
 
   if $OCR; then
     local pre_ocr="${tmpdir}/pre_ocr.pdf"
-    if $COMPRESS; then
+    if $compress; then
       do_compress "$merged" "$pre_ocr"
     else
       cp "$merged" "$pre_ocr"
     fi
     do_ocr "$pre_ocr" "$OUTPUT"
-  elif $COMPRESS; then
+  elif $compress; then
     do_compress "$merged" "$OUTPUT"
   else
     cp "$merged" "$OUTPUT"
@@ -1247,7 +1417,7 @@ if [[ $# -eq 0 ]]; then
   run_interactive
 else
   # Arguments CLI → mode direct (comportement d'origine)
-  normalize_paper_format
+  validate_options
   check_deps
   main_process
 fi
