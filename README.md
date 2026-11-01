@@ -122,6 +122,7 @@ The script guides you step by step:
 | `-t <0-100>` | Binarisation threshold (mode `bw`) | `55` |
 | `-w <0-100>` | Whitening threshold (mode `clean`) | `75` |
 | `-b <0-3>` | Noise-reduction blur radius before binarisation | `0` |
+| `-s` | Do not straighten skewed pages (also `--sans-redressement`) | — |
 | `-C` | Disable Ghostscript compression | — |
 | `-y` | Overwrite the output file if it already exists (otherwise: prompt, or error outside a terminal) | — |
 | `-V` | Open the resulting file at the end (`xdg-open`) | — |
