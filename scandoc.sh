@@ -53,6 +53,7 @@ SCAN_SOURCE=""          # Source SANE (ex : "ADF", "Flatbed") — auto-détecté
 DUPLEX=false            # Recto verso avec le chargeur (-2 / --recto-verso)
 KEEP_TEMP=false         # Garder les fichiers temporaires (debug)
 COMPRESS=true           # Compresser le PDF final avec ghostscript
+DESKEW=true             # Redresser les pages scannées de travers (-s pour désactiver)
 DEPTH=8                 # Profondeur de couleur (8=standard, 16=haute fidélité)
 OUTPUT_FORMAT="pdf"     # Format de sortie : pdf | jpeg
 JPEG_QUALITY=85         # Qualité JPEG (1-100, 85=bon compromis qualité/taille)
@@ -258,7 +259,7 @@ _to_bool() {
 
 # Clés autorisées dans le fichier de configuration
 CONFIG_KEYS=(DEVICE SCAN_SOURCE RESOLUTION MODE PAPER_FORMAT OUTPUT_FORMAT OUTPUT_DIR
-             JPEG_QUALITY THRESHOLD WHITE_THRESH BLUR COMPRESS OCR OCR_LANG STRIP_META OPEN_RESULT)
+             JPEG_QUALITY THRESHOLD WHITE_THRESH BLUR COMPRESS DESKEW OCR OCR_LANG STRIP_META OPEN_RESULT)
 
 # Lit le fichier de configuration (CLÉ=valeur, une par ligne, # pour commenter).
 # Le fichier n'est jamais exécuté : seules les clés connues sont lues.
@@ -285,7 +286,7 @@ load_config() {
       continue
     fi
     case "$key" in
-      COMPRESS|OCR|OPEN_RESULT)
+      COMPRESS|DESKEW|OCR|OPEN_RESULT)
         val=$(_to_bool "$val") || { warn "Configuration : ${key} doit valoir true ou false, ignoré."; continue; } ;;
       STRIP_META)
         case "${val,,}" in
@@ -720,6 +721,7 @@ menu_summary() {
     fi
   fi
   if [[ -n "$INPUT_FILE" ]]; then printf "    %-22s ${CYAN}%s${RESET}\n" "Source :" "$INPUT_FILE"; fi
+  if [[ -z "$INPUT_FILE" ]]; then printf "    %-22s ${CYAN}%s${RESET}\n" "Redressement :" "$($DESKEW && echo 'oui' || echo 'non')"; fi
   if [[ -n "$DEVICE" ]]; then printf "    %-22s ${CYAN}%s${RESET}\n" "Scanner :" "$DEVICE"; fi
   if [[ "$MODE" == "bw" ]]; then printf "    %-22s ${CYAN}%s${RESET}\n" "Seuil BW :" "${THRESHOLD}%"; fi
   if [[ "$MODE" == "clean" ]]; then printf "    %-22s ${CYAN}%s${RESET}\n" "Seuil blanc :" "${WHITE_THRESH}%"; fi
@@ -841,6 +843,7 @@ ${BOLD}OPTIONS${RESET}
   -V             Ouvrir le fichier produit à la fin (xdg-open)
   -k             Garder les fichiers temporaires
   -C             Désactiver la compression ghostscript
+  -s             Ne pas redresser les pages scannées (aussi --sans-redressement)
   -l             Lister les scanners disponibles
   -D             Diagnostic : réglages acceptés par chaque scanner (aussi --diagnostic)
   -h             Afficher cette aide
@@ -890,6 +893,7 @@ for _a in "$@"; do
   case "$_a" in
     --diagnostic) _args+=("-D") ;;
     --recto-verso|--duplex) _args+=("-2") ;;
+    --sans-redressement) _args+=("-s") ;;
     --help)       _args+=("-h") ;;
     *)            _args+=("$_a") ;;
   esac
@@ -897,7 +901,7 @@ done
 set -- "${_args[@]}"
 unset _args _a
 
-while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMDlh2" opt; do
+while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMDlhs2" opt; do
   case $opt in
     r) RESOLUTION="$OPTARG" ;;
     m) MODE="$OPTARG" ;;
@@ -919,6 +923,7 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMDlh2" opt; do
     y) FORCE=true ;;
     V) OPEN_RESULT=true ;;
     C) COMPRESS=false ;;
+    s) DESKEW=false ;;
     R) OCR=true ;;
     M) STRIP_META=all ;;
     D) DIAGNOSTIC=true ;;
@@ -1484,17 +1489,36 @@ _scan_opts() {
   if $SCAN_RES_OPT; then SCAN_OPTS+=("--resolution=$RESOLUTION"); fi
 }
 
-# En mode auto : recadrage automatique des bandes noires/vides en bordure
-_auto_trim() {
+# Bords d'une page scannée : le fond du scanner (souvent noir) apparaît autour
+# de la feuille, en triangles quand elle est entrée de travers.
+#  1. -deskew      : redresse la page d'après l'inclinaison des lignes (si DESKEW)
+#  2. -trim        : en format auto, recadre sur la feuille
+#  3. remplissage  : ce qui reste du fond sombre touchant le bord devient blanc
+#                    (une bordure noire de 1 px relie tous les bords entre eux)
+#  4. -extent      : en format fixe, on revient aux dimensions demandées
+_clean_edges() {
   local file="$1"
-  [[ "$PAPER_FORMAT" == "auto" ]] || return 0
-  local trimmed
-  trimmed=$(mktemp --suffix=.pnm)
-  if convert "$file" -fuzz 8% -trim +repage "$trimmed" 2>/dev/null; then
-    mv "$trimmed" "$file"
+  local args=() size=""
+  [[ "$PAPER_FORMAT" != "auto" ]] && size=$(identify -format '%wx%h' "$file" 2>/dev/null || true)
+  if $DESKEW; then
+    args+=("-background" "black" "-deskew" "40%" "+repage")
+  fi
+  if [[ "$PAPER_FORMAT" == "auto" ]]; then
+    args+=("-fuzz" "25%" "-trim" "+repage")
+  fi
+  args+=("-bordercolor" "black" "-border" "1" "-fuzz" "25%" "-fill" "white"
+         "-draw" "color 0,0 floodfill" "-shave" "1x1" "+repage")
+  if [[ -n "$size" ]]; then
+    args+=("-background" "white" "-gravity" "center" "-extent" "$size")
+  fi
+  [[ ${#args[@]} -gt 0 ]] || return 0
+  local tmp
+  tmp=$(mktemp --suffix=.pnm)
+  if convert "$file" "${args[@]}" "$tmp" 2>/dev/null; then
+    mv "$tmp" "$file"
   else
-    rm -f "$trimmed"
-    warn "Recadrage automatique échoué, image conservée telle quelle."
+    rm -f "$tmp"
+    warn "Nettoyage des bords échoué, image conservée telle quelle."
   fi
 }
 
@@ -1514,10 +1538,8 @@ do_scan() {
   fi
   rm -f "$scan_err"
 
-  if [[ "$PAPER_FORMAT" == "auto" ]]; then
-    info "Recadrage automatique des bords..."
-    _auto_trim "$outfile"
-  fi
+  if $DESKEW; then info "Redressement et nettoyage des bords..."; else info "Nettoyage des bords..."; fi
+  _clean_edges "$outfile"
 
   success "Scan terminé → $outfile"
 }
@@ -1555,7 +1577,7 @@ do_scan_adf() {
   for f in "${pages_ok[@]}"; do
     n=$(( n + 1 ))
     echo -e "${BOLD}--- Page ${n}/${#pages_ok[@]} ---${RESET}"
-    _auto_trim "$f"
+    _clean_edges "$f"
     local proc_tmp="${tmpdir}/page_${n}_processed.$(_page_ext)"
     do_process "$f" "$proc_tmp"
     PAGES+=("$proc_tmp")
