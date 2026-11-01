@@ -1496,6 +1496,10 @@ _scan_opts() {
 #  3. remplissage  : ce qui reste du fond sombre touchant le bord devient blanc
 #                    (une bordure noire de 1 px relie tous les bords entre eux)
 #  4. -extent      : en format fixe, on revient aux dimensions demandées
+_edges_msg() {
+  if $DESKEW; then info "Redressement et nettoyage des bords..."; else info "Nettoyage des bords..."; fi
+}
+
 _clean_edges() {
   local file="$1"
   local args=() size=""
@@ -1538,7 +1542,7 @@ do_scan() {
   fi
   rm -f "$scan_err"
 
-  if $DESKEW; then info "Redressement et nettoyage des bords..."; else info "Nettoyage des bords..."; fi
+  _edges_msg
   _clean_edges "$outfile"
 
   success "Scan terminé → $outfile"
@@ -1577,6 +1581,7 @@ do_scan_adf() {
   for f in "${pages_ok[@]}"; do
     n=$(( n + 1 ))
     echo -e "${BOLD}--- Page ${n}/${#pages_ok[@]} ---${RESET}"
+    _edges_msg
     _clean_edges "$f"
     local proc_tmp="${tmpdir}/page_${n}_processed.$(_page_ext)"
     do_process "$f" "$proc_tmp"
