@@ -22,9 +22,11 @@
 set -euo pipefail
 
 # --- Couleurs terminal -------------------------------------------------------
-RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'; DIM='\033[2m'
-BLUE='\033[0;34m'
+# Syntaxe $'…' : les séquences d'échappement sont interprétées dès l'affectation,
+# ce qui permet de les utiliser aussi avec cat/printf (ex. : l'aide -h).
+RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; GREEN=$'\033[0;32m'
+CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'; DIM=$'\033[2m'
+BLUE=$'\033[0;34m'
 
 info()    { echo -e "${CYAN}[INFO]${RESET} $*"; }
 success() { echo -e "${GREEN}[OK]${RESET}  $*"; }
@@ -46,18 +48,23 @@ BLUR=0                  # Rayon de flou avant traitement (0=désactivé)
 DEVICE=""               # Scanner SANE (auto-détecté si vide)
 MULTI_PAGE=false        # Scan multi-pages avec pause entre chaque page
 NB_PAGES=1              # Nombre de pages (mode multi-pages)
-MULTI_PAGE_MODE="fixed" # Mode multi-pages : fixed (nombre connu) | auto (continu jusqu'à stop)
-MERGED_PDF=""           # Chemin du PDF assemblé (rempli par do_multi_page)
+MULTI_PAGE_MODE="fixed" # Mode multi-pages : fixed (nombre connu) | auto (continu jusqu'à stop) | adf (chargeur)
+SCAN_SOURCE=""          # Source SANE (ex : "ADF", "Flatbed") — auto-détectée en mode adf si vide
 KEEP_TEMP=false         # Garder les fichiers temporaires (debug)
 COMPRESS=true           # Compresser le PDF final avec ghostscript
 DEPTH=8                 # Profondeur de couleur (8=standard, 16=haute fidélité)
 OUTPUT_FORMAT="pdf"     # Format de sortie : pdf | jpeg
 JPEG_QUALITY=85         # Qualité JPEG (1-100, 85=bon compromis qualité/taille)
-MULTI_PAGE_FILES=()     # Chemins des pages traitées en mode multi-pages JPEG
+PAGES=()                # Pages traitées, dans l'ordre (remplies avant la finalisation)
 OCR=false               # Activer l'OCR (texte sélectionnable) avec ocrmypdf
 OCR_LANG="fra+eng"      # Langue(s) OCR : fra, eng, deu, spa... (séparer par +)
 STRIP_META=false        # Métadonnées : false | all (tout supprimer) | nodates (tout sauf dates)
 SCAN_TMPDIR=""          # Répertoire temporaire de travail (global pour le trap EXIT)
+OUTPUT_DIR=""           # Dossier où ranger les fichiers dont le nom est donné sans chemin
+OPEN_RESULT=false       # Ouvrir le fichier produit à la fin (xdg-open / open)
+FORCE=false             # Écraser un fichier existant sans demander (-y)
+OVERWRITE_OK=false      # Écrasement déjà confirmé (mode interactif)
+CONFIG_FILE="${SCANDOC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/scandoc.conf}"
 
 # =============================================================================
 #  VÉRIFICATION DES DÉPENDANCES
@@ -76,7 +83,19 @@ check_deps() {
   fi
 
   if [[ ${#missing[@]} -gt 0 ]]; then
-    error "Dépendances manquantes : ${missing[*]}\n  → sudo apt install ${missing[*]}"
+    # Dédoublonnage (imagemagick et ghostscript peuvent être signalés deux fois)
+    local uniq; uniq=$(printf '%s\n' "${missing[@]}" | awk '!seen[$0]++' | tr '\n' ' ')
+    error "Dépendances manquantes : ${uniq% }\n  → sudo apt install ${uniq% }"
+  fi
+
+  if [[ "$STRIP_META" != "false" ]] && [[ "$OUTPUT_FORMAT" == "pdf" ]]; then
+    local opt_missing; opt_missing=$(_missing_pdf_meta_tools)
+    if [[ -n "$opt_missing" ]]; then
+      warn "Suppression des métadonnées partielle sans : ${opt_missing}  (sudo apt install ${opt_missing})"
+    fi
+  fi
+  if [[ "$STRIP_META" != "false" ]] && [[ "$OUTPUT_FORMAT" == "jpeg" ]] && ! command -v exiftool &>/dev/null; then
+    warn "exiftool absent : les métadonnées JPEG seront conservées (sudo apt install libimage-exiftool-perl)."
   fi
 }
 
@@ -148,7 +167,7 @@ section() {
 print_opt() {
   local num="$1" label="$2" desc="$3" is_default="${4:-false}"
   if [[ "$is_default" == "true" ]]; then
-    printf "    ${BOLD}[%s]${RESET} %-28s ${DIM}%s${RESET}  ${GREEN}★ recommandé${RESET}\n" \
+    printf "    ${BOLD}[%s]${RESET} %-28s ${DIM}%s${RESET}  ${GREEN}★ par défaut${RESET}\n" \
       "$num" "$label" "$desc"
   else
     printf "    ${BOLD}[%s]${RESET} %-28s ${DIM}%s${RESET}\n" "$num" "$label" "$desc"
@@ -178,6 +197,142 @@ ask_choice() {
   done
 }
 
+# Invite nombre entier borné, redemandé tant que la saisie est invalide — résultat dans $REPLY
+ask_int() {
+  local prompt="$1" default="$2" min="$3" max="$4"
+  while true; do
+    ask "$prompt" "$default"
+    if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( 10#$REPLY >= min && 10#$REPLY <= max )); then
+      REPLY=$(( 10#$REPLY ))
+      return 0
+    fi
+    warn "Valeur invalide. Entrez un nombre entre $min et $max."
+  done
+}
+
+# Nettoie un chemin saisi au clavier ou glissé-déposé depuis un gestionnaire de
+# fichiers : espaces autour, guillemets '…' ou "…", URI file://… (avec %20),
+# espaces échappés « \  », et ~ en début de chemin.
+_clean_path() {
+  local p="$1"
+  p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+  if [[ ${#p} -ge 2 ]] && [[ ( "$p" == \'*\' ) || ( "$p" == \"*\" ) ]]; then
+    p="${p:1:${#p}-2}"
+  fi
+  if [[ "$p" == file://* ]]; then
+    p="${p#file://}"
+    p="${p#localhost}"
+    p=$(printf '%b' "${p//%/\\x}")
+  fi
+  if [[ ! -e "$p" ]] && [[ "$p" == *\\* ]]; then
+    p="${p//\\ / }"
+  fi
+  if [[ "$p" == "~" ]]; then
+    p="$HOME"
+  elif [[ "$p" == "~/"* ]]; then
+    p="${HOME}/${p#"~/"}"
+  fi
+  printf '%s' "$p"
+}
+
+# Normalise un booléen de configuration (true/false, oui/non, 1/0, yes/no)
+_to_bool() {
+  case "${1,,}" in
+    true|oui|o|yes|y|1) echo true ;;
+    false|non|n|no|0|"") echo false ;;
+    *) return 1 ;;
+  esac
+}
+
+# Clés autorisées dans le fichier de configuration
+CONFIG_KEYS=(DEVICE SCAN_SOURCE RESOLUTION MODE PAPER_FORMAT OUTPUT_FORMAT OUTPUT_DIR
+             JPEG_QUALITY THRESHOLD WHITE_THRESH BLUR COMPRESS OCR OCR_LANG STRIP_META OPEN_RESULT)
+
+# Lit le fichier de configuration (CLÉ=valeur, une par ligne, # pour commenter).
+# Le fichier n'est jamais exécuté : seules les clés connues sont lues.
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local line key val n=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$(( n + 1 ))
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    if [[ ! "$line" =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=(.*)$ ]]; then
+      warn "Configuration ligne ${n} ignorée (format CLÉ=valeur attendu) : ${line}"
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+    val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+    if [[ "$val" == \"*\" ]] && [[ ${#val} -ge 2 ]]; then
+      val="${val:1:${#val}-2}"; val="${val//\\\"/\"}"; val="${val//\\\\/\\}"
+    elif [[ "$val" == \'*\' ]] && [[ ${#val} -ge 2 ]]; then
+      val="${val:1:${#val}-2}"
+    fi
+    if [[ ! " ${CONFIG_KEYS[*]} " == *" $key "* ]]; then
+      warn "Configuration ligne ${n} : clé inconnue « ${key} », ignorée."
+      continue
+    fi
+    case "$key" in
+      COMPRESS|OCR|OPEN_RESULT)
+        val=$(_to_bool "$val") || { warn "Configuration : ${key} doit valoir true ou false, ignoré."; continue; } ;;
+      STRIP_META)
+        case "${val,,}" in
+          all|nodates) val="${val,,}" ;;
+          false|non|no|0|"") val=false ;;
+          *) warn "Configuration : STRIP_META doit valoir all, nodates ou false, ignoré."; continue ;;
+        esac ;;
+      OUTPUT_DIR) val=$(_clean_path "$val") ;;
+    esac
+    printf -v "$key" '%s' "$val"
+  done < "$CONFIG_FILE"
+}
+
+# Écrit les réglages courants dans le fichier de configuration
+save_config() {
+  local dir; dir=$(dirname -- "$CONFIG_FILE")
+  mkdir -p -- "$dir" || error "Impossible de créer le dossier ${dir}"
+  local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || error "Impossible d'écrire dans ${dir}"
+  {
+    echo "# Réglages par défaut de scandoc.sh — modifiable à la main."
+    echo "# Les options de la ligne de commande restent prioritaires."
+    local key val
+    for key in "${CONFIG_KEYS[@]}"; do
+      val="${!key}"
+      val="${val//\\/\\\\}"; val="${val//\"/\\\"}"
+      printf '%s="%s"\n' "$key" "$val"
+    done
+  } > "$tmp"
+  mv -- "$tmp" "$CONFIG_FILE"
+  success "Réglages enregistrés dans ${CONFIG_FILE}"
+}
+
+# Ouvre le fichier produit avec l'application par défaut, sans bloquer le terminal
+_open_result() {
+  local f="$1" opener=""
+  if command -v xdg-open &>/dev/null; then opener="xdg-open"
+  elif command -v open &>/dev/null; then opener="open"
+  else
+    warn "Ouverture impossible : ni xdg-open ni open n'est disponible."
+    return 0
+  fi
+  info "Ouverture de ${f}..."
+  nohup "$opener" "$f" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# _with_ext CHEMIN EXT — remplace l'extension pdf/jpg/jpeg du nom de fichier par EXT.
+# Seul le nom de base est examiné : « ./scans/facture » → « ./scans/facture.pdf »,
+# et une autre extension est conservée : « facture.2024 » → « facture.2024.pdf ».
+_with_ext() {
+  local path="$1" ext="$2"
+  local base="${path##*/}"
+  local cur="${base##*.}"
+  if [[ "$base" == *.* ]] && [[ "${cur,,}" =~ ^(pdf|jpg|jpeg)$ ]]; then
+    path="${path%.*}"
+  fi
+  echo "${path}.${ext}"
+}
+
 # =============================================================================
 #  MENUS INTERACTIFS
 # =============================================================================
@@ -188,28 +343,45 @@ menu_main() {
   print_opt "2" "Traiter un fichier existant"      "Image ou PDF déjà présent sur le disque"
   print_opt "3" "Scanner plusieurs pages"          "Pause entre chaque page, PDF assemblé automatiquement"
   print_opt "4" "Lister les scanners disponibles"  "Affiche les scanners détectés par SANE"
-  print_opt "5" "Quitter"                          ""
-  ask_choice "Votre choix" "1" "5"
+  print_opt "5" "Réglages par défaut"              "Scanner, résolution, mode, dossier… mémorisés pour la suite"
+  print_opt "6" "Quitter"                          ""
+  ask_choice "Votre choix" "1" "6"
 }
 
 menu_input_file() {
   section "Fichier source à traiter"
   echo -e "    ${DIM}Formats supportés : JPG, PNG, TIFF, BMP, PNM, PDF…${RESET}"
   echo ""
-  ask "Chemin complet du fichier" ""
-  INPUT_FILE="$REPLY"
-  [[ -z "$INPUT_FILE" ]] && error "Aucun fichier spécifié."
-  [[ -f "$INPUT_FILE" ]] || error "Fichier introuvable : $INPUT_FILE"
+  echo -e "    ${DIM}Vous pouvez glisser-déposer le fichier dans le terminal ; ~ est accepté.${RESET}"
+  echo ""
+  while true; do
+    ask "Chemin complet du fichier" ""
+    INPUT_FILE=$(_clean_path "$REPLY")
+    if [[ -z "$INPUT_FILE" ]]; then
+      warn "Aucun fichier spécifié."
+    elif [[ -f "$INPUT_FILE" ]]; then
+      break
+    else
+      warn "Fichier introuvable : $INPUT_FILE"
+    fi
+  done
   success "Fichier sélectionné : $INPUT_FILE"
 }
 
 menu_device() {
   section "Scanner à utiliser"
-  print_opt "1" "Auto-détection (conseillé)"  "Laisse SANE choisir le scanner disponible"  "true"
+  local def=1 max=2
+  if [[ -n "$DEVICE" ]]; then def=3; max=3; fi
+  print_opt "1" "Auto-détection (conseillé)"  "Laisse SANE choisir le scanner disponible"  "$([[ $def == 1 ]] && echo true)"
   print_opt "2" "Saisir manuellement"          "Entrer l'identifiant SANE du scanner"
-  ask_choice "Votre choix" "1" "2"
+  if [[ -n "$DEVICE" ]]; then
+    print_opt "3" "Scanner enregistré"         "$DEVICE"  "true"
+  fi
+  ask_choice "Votre choix" "$def" "$max"
 
-  if [[ "$REPLY" == "2" ]]; then
+  if [[ "$REPLY" == "1" ]]; then
+    DEVICE=""
+  elif [[ "$REPLY" == "2" ]]; then
     echo ""
     info "Scanners détectés sur ce système :"
     scanimage -L 2>/dev/null || warn "Aucun scanner détecté (vérifiez la connexion USB/réseau)."
@@ -224,13 +396,20 @@ menu_format() {
   echo -e "    ${DIM}Définit la zone de scan. En mode auto, le scanner scanne en plein format${RESET}"
   echo -e "    ${DIM}puis les bandes noires sont supprimées automatiquement.${RESET}"
   echo ""
-  print_opt "1" "Auto (détection automatique)"  "Scan pleine zone + recadrage intelligent des bords"  "true"
-  print_opt "2" "A4         210 × 297 mm"        "Standard européen — lettre, facture, contrat"
-  print_opt "3" "A5         148 × 210 mm"        "Demi-format A4 — livret, carnet"
-  print_opt "4" "Letter     216 × 279 mm"        "Format américain US Letter"
-  print_opt "5" "Legal      216 × 356 mm"        "Format américain US Legal (plus long)"
-  print_opt "6" "Personnalisé"                   "Saisir largeur et hauteur en millimètres"
-  ask_choice "Votre choix" "1" "6"
+  local def=1 cw=210 ch=297
+  case "${PAPER_FORMAT,,}" in
+    a4) def=2 ;; a5) def=3 ;; letter) def=4 ;; legal) def=5 ;;
+    custom:*|[0-9]*x*)
+      def=6
+      local dims="${PAPER_FORMAT#custom:}"; cw="${dims%x*}"; ch="${dims#*x}" ;;
+  esac
+  print_opt "1" "Auto (détection automatique)"  "Scan pleine zone + recadrage intelligent des bords"  "$([[ $def == 1 ]] && echo true)"
+  print_opt "2" "A4         210 × 297 mm"        "Standard européen — lettre, facture, contrat"  "$([[ $def == 2 ]] && echo true)"
+  print_opt "3" "A5         148 × 210 mm"        "Demi-format A4 — livret, carnet"  "$([[ $def == 3 ]] && echo true)"
+  print_opt "4" "Letter     216 × 279 mm"        "Format américain US Letter"  "$([[ $def == 4 ]] && echo true)"
+  print_opt "5" "Legal      216 × 356 mm"        "Format américain US Legal (plus long)"  "$([[ $def == 5 ]] && echo true)"
+  print_opt "6" "Personnalisé"                   "Saisir largeur et hauteur en millimètres"  "$([[ $def == 6 ]] && echo true)"
+  ask_choice "Votre choix" "$def" "6"
 
   case "$REPLY" in
     1) PAPER_FORMAT="auto" ;;
@@ -239,9 +418,9 @@ menu_format() {
     4) PAPER_FORMAT="Letter" ;;
     5) PAPER_FORMAT="Legal" ;;
     6)
-      ask "Largeur en mm" "210"
+      ask_int "Largeur en mm" "$cw" 10 2000
       local w="$REPLY"
-      ask "Hauteur en mm" "297"
+      ask_int "Hauteur en mm" "$ch" 10 5000
       PAPER_FORMAT="custom:${w}x${REPLY}"
       ;;
   esac
@@ -252,19 +431,20 @@ menu_resolution() {
   section "Résolution de scan"
   echo -e "    ${DIM}Plus la résolution est élevée, plus l'image est nette — mais le fichier est plus lourd.${RESET}"
   echo ""
-  print_opt "1" "150 dpi  — Rapide / Léger"    "Emails, documents simples              ~0.5 Mo"
-  print_opt "2" "300 dpi  — Standard"           "Usage quotidien, bonne qualité         ~2 Mo"   "true"
-  print_opt "3" "600 dpi  — Haute qualité"      "Contrats, photos, archivage            ~8 Mo"
-  print_opt "4" "Valeur personnalisée"           "Saisir un nombre en dpi"
-  ask_choice "Votre choix" "2" "4"
+  local def=4
+  case "$RESOLUTION" in 150) def=1 ;; 300) def=2 ;; 600) def=3 ;; esac
+  print_opt "1" "150 dpi  — Rapide / Léger"    "Emails, documents simples              ~0.5 Mo"  "$([[ $def == 1 ]] && echo true)"
+  print_opt "2" "300 dpi  — Standard"           "Usage quotidien, bonne qualité         ~2 Mo"    "$([[ $def == 2 ]] && echo true)"
+  print_opt "3" "600 dpi  — Haute qualité"      "Contrats, photos, archivage            ~8 Mo"    "$([[ $def == 3 ]] && echo true)"
+  print_opt "4" "Valeur personnalisée"           "Saisir un nombre en dpi$([[ $def == 4 ]] && echo " (actuel : ${RESOLUTION})")"  "$([[ $def == 4 ]] && echo true)"
+  ask_choice "Votre choix" "$def" "4"
 
   case "$REPLY" in
     1) RESOLUTION=150 ;;
     2) RESOLUTION=300 ;;
     3) RESOLUTION=600 ;;
     4)
-      ask "Résolution en dpi" "300"
-      [[ "$REPLY" =~ ^[0-9]+$ ]] || error "Valeur invalide : $REPLY"
+      ask_int "Résolution en dpi (50-4800)" "$RESOLUTION" 50 4800
       RESOLUTION="$REPLY"
       ;;
   esac
@@ -275,11 +455,13 @@ menu_mode() {
   section "Mode de traitement"
   echo -e "    ${DIM}Détermine le filtre appliqué à l'image après le scan.${RESET}"
   echo ""
-  print_opt "1" "clean  — Nettoyage fond gris"    "Blanchit le fond, préserve couleurs  → lettres, factures" "true"
-  print_opt "2" "bw     — Noir et blanc pur"       "Texte noir sur fond blanc, très léger → formulaires, reçus"
-  print_opt "3" "color  — Normalisation couleurs"  "Booste les couleurs → photos, plans, documents colorés"
-  print_opt "4" "scan   — Brut (sans retouche)"    "Pas de traitement, PDF direct du scanner"
-  ask_choice "Votre choix" "1" "4"
+  local def=1
+  case "${MODE,,}" in bw) def=2 ;; color) def=3 ;; scan) def=4 ;; esac
+  print_opt "1" "clean  — Nettoyage fond gris"    "Blanchit le fond, préserve couleurs  → lettres, factures"  "$([[ $def == 1 ]] && echo true)"
+  print_opt "2" "bw     — Noir et blanc pur"       "Texte noir sur fond blanc, très léger → formulaires, reçus" "$([[ $def == 2 ]] && echo true)"
+  print_opt "3" "color  — Normalisation couleurs"  "Booste les couleurs → photos, plans, documents colorés"     "$([[ $def == 3 ]] && echo true)"
+  print_opt "4" "scan   — Brut (sans retouche)"    "Pas de traitement, PDF direct du scanner"                   "$([[ $def == 4 ]] && echo true)"
+  ask_choice "Votre choix" "$def" "4"
 
   case "$REPLY" in
     1) MODE="clean" ;;
@@ -296,20 +478,21 @@ menu_multipage() {
   echo ""
   print_opt "1" "Nombre fixe de pages"          "Vous savez combien de pages scanner"          "true"
   print_opt "2" "Mode continu (sans compter)"    "Scan page par page — vous décidez quand arrêter"
-  ask_choice "Votre choix" "1" "2"
+  print_opt "3" "Chargeur automatique (ADF)"     "Toutes les pages du bac d'un coup, sans intervention"
+  ask_choice "Votre choix" "1" "3"
 
   if [[ "$REPLY" == "1" ]]; then
     MULTI_PAGE_MODE="fixed"
     echo ""
-    ask "Nombre de pages à scanner" "$NB_PAGES"
-    if [[ ! "$REPLY" =~ ^[0-9]+$ ]] || [[ "$REPLY" -lt 1 ]]; then
-      error "Nombre de pages invalide : $REPLY"
-    fi
+    ask_int "Nombre de pages à scanner" "$NB_PAGES" 1 999
     NB_PAGES="$REPLY"
     success "$NB_PAGES page(s) configurée(s)."
-  else
+  elif [[ "$REPLY" == "2" ]]; then
     MULTI_PAGE_MODE="auto"
     success "Mode continu : vous serez invité après chaque page."
+  else
+    MULTI_PAGE_MODE="adf"
+    success "Chargeur automatique : placez toutes les pages dans le bac."
   fi
 }
 
@@ -323,7 +506,7 @@ menu_advanced() {
       echo -e "  ${BOLD}Seuil de blanchiment${RESET}  ${DIM}(mode clean)${RESET}"
       echo -e "  ${DIM}Les pixels plus clairs que ce seuil sont forcés en blanc pur.${RESET}"
       echo -e "  ${DIM}  ↑ Monter si le fond gris persiste   ↓ Descendre si les couleurs s'effacent${RESET}"
-      ask "Seuil (0-100)" "$WHITE_THRESH"
+      ask_int "Seuil (0-100)" "$WHITE_THRESH" 0 100
       WHITE_THRESH="$REPLY"
       echo ""
       ;;
@@ -331,13 +514,13 @@ menu_advanced() {
       echo -e "  ${BOLD}Seuil de binarisation${RESET}  ${DIM}(mode bw)${RESET}"
       echo -e "  ${DIM}En dessous de ce seuil → noir pur. Au-dessus → blanc pur.${RESET}"
       echo -e "  ${DIM}  ↑ Monter si le fond gris persiste   ↓ Descendre si le texte disparaît${RESET}"
-      ask "Seuil (0-100)" "$THRESHOLD"
+      ask_int "Seuil (0-100)" "$THRESHOLD" 0 100
       THRESHOLD="$REPLY"
       echo ""
       echo -e "  ${BOLD}Flou anti-bruit${RESET}"
       echo -e "  ${DIM}Lisse légèrement l'image avant la binarisation pour réduire le grain.${RESET}"
       echo -e "  ${DIM}  0 = désactivé   1 = léger   2 = moyen (recommandé pour vieux documents)${RESET}"
-      ask "Rayon de flou (0-3)" "$BLUR"
+      ask_int "Rayon de flou (0-3)" "$BLUR" 0 3
       BLUR="$REPLY"
       echo ""
       ;;
@@ -351,36 +534,37 @@ menu_advanced() {
     echo -e "  ${BOLD}Compression Ghostscript${RESET}"
     echo -e "  ${DIM}Optimise la taille du PDF final sans perte visible de qualité.${RESET}"
     echo ""
-    print_opt "1" "Activée (recommandé)"  "Réduit significativement la taille du fichier"  "true"
-    print_opt "2" "Désactivée"            "PDF non optimisé (plus volumineux)"
-    ask_choice "Compression" "1" "2"
-    if [[ "$REPLY" == "2" ]]; then COMPRESS=false; fi
+    local def=1; if ! $COMPRESS; then def=2; fi
+    print_opt "1" "Activée (recommandé)"  "Réduit significativement la taille du fichier"  "$([[ $def == 1 ]] && echo true)"
+    print_opt "2" "Désactivée"            "PDF non optimisé (plus volumineux)"            "$([[ $def == 2 ]] && echo true)"
+    ask_choice "Compression" "$def" "2"
+    if [[ "$REPLY" == "2" ]]; then COMPRESS=false; else COMPRESS=true; fi
   else
     echo -e "  ${BOLD}Qualité JPEG${RESET}"
     echo -e "  ${DIM}Plus la valeur est haute, meilleure est la qualité — mais le fichier est plus lourd.${RESET}"
     echo -e "  ${DIM}  75 = léger   85 = bon compromis   95 = haute fidélité${RESET}"
     echo ""
-    ask "Qualité (1-100)" "$JPEG_QUALITY"
-    if [[ "$REPLY" =~ ^[0-9]+$ ]] && [[ "$REPLY" -ge 1 ]] && [[ "$REPLY" -le 100 ]]; then
-      JPEG_QUALITY="$REPLY"
-    else
-      warn "Valeur invalide, qualité conservée à ${JPEG_QUALITY}."
-    fi
+    ask_int "Qualité (1-100)" "$JPEG_QUALITY" 1 100
+    JPEG_QUALITY="$REPLY"
   fi
 
   success "Options avancées appliquées."
 }
 
-menu_output() {
-  section "Format et fichier de sortie"
-
+menu_output_format() {
   echo -e "  ${BOLD}Format de sortie${RESET}"
   echo ""
-  print_opt "1" "PDF  (recommandé)"   "Un seul fichier, idéal pour documents et archivage"  "true"
-  print_opt "2" "JPEG"                "Image(s) — pratique pour envoyer par email ou partager"
-  ask_choice "Votre choix" "1" "2"
+  local def=1; if [[ "$OUTPUT_FORMAT" == "jpeg" || "$OUTPUT_FORMAT" == "jpg" ]]; then def=2; fi
+  print_opt "1" "PDF"   "Un seul fichier, idéal pour documents et archivage"      "$([[ $def == 1 ]] && echo true)"
+  print_opt "2" "JPEG"  "Image(s) — pratique pour envoyer par email ou partager"  "$([[ $def == 2 ]] && echo true)"
+  ask_choice "Votre choix" "$def" "2"
   if [[ "$REPLY" == "2" ]]; then OUTPUT_FORMAT="jpeg"; else OUTPUT_FORMAT="pdf"; fi
   echo ""
+}
+
+menu_output() {
+  section "Format et fichier de sortie"
+  menu_output_format
 
   local ext; if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then ext="jpg"; else ext="pdf"; fi
   local default_name="scan_$(date +%Y%m%d_%H%M%S).${ext}"
@@ -389,20 +573,121 @@ menu_output() {
   else
     echo -e "    ${DIM}Nom du fichier à créer. Laissez vide pour un nom généré automatiquement.${RESET}"
   fi
+  if [[ -n "$OUTPUT_DIR" ]]; then
+    echo -e "    ${DIM}Un nom sans dossier sera rangé dans : ${OUTPUT_DIR}${RESET}"
+  fi
   echo ""
-  ask "Nom du fichier (.${ext})" "$default_name"
-  OUTPUT="${REPLY%.*}.${ext}"
+  while true; do
+    ask "Nom du fichier (.${ext})" "$default_name"
+    OUTPUT=$(_clean_path "$REPLY")
+    resolve_output
+    local out_dir; out_dir=$(dirname -- "$OUTPUT")
+    if [[ ! -d "$out_dir" ]]; then
+      warn "Dossier introuvable : ${out_dir}"
+      continue
+    fi
+    local existing; existing=$(_existing_output)
+    if [[ -n "$existing" ]]; then
+      echo -ne "  ${YELLOW}Le fichier ${BOLD}${existing}${RESET}${YELLOW} existe déjà. L'écraser ?${RESET} ${DIM}[o/N]${RESET} : "
+      read -r _ow
+      if [[ "${_ow,,}" != "o" ]]; then continue; fi
+      OVERWRITE_OK=true
+    fi
+    break
+  done
   success "Format : ${OUTPUT_FORMAT^^}  —  Sortie : $OUTPUT"
+}
+
+# Nom de sortie définitif : nom par défaut si vide, dossier OUTPUT_DIR si aucun
+# chemin n'est donné, extension selon le format. Peut être rappelée sans effet.
+resolve_output() {
+  local ext; if [[ "$OUTPUT_FORMAT" == "jpeg" || "$OUTPUT_FORMAT" == "jpg" ]]; then ext="jpg"; else ext="pdf"; fi
+  if [[ -z "$OUTPUT" ]]; then OUTPUT="scan_$(date +%Y%m%d_%H%M%S).${ext}"; fi
+  if [[ -n "$OUTPUT_DIR" ]] && [[ "$OUTPUT" != */* ]]; then
+    OUTPUT="${OUTPUT_DIR%/}/${OUTPUT}"
+  fi
+  OUTPUT=$(_with_ext "$OUTPUT" "$ext")
+}
+
+# Affiche le premier fichier de sortie qui existe déjà (rien sinon). En JPEG
+# multi-pages, les fichiers produits s'appellent nom_001.jpg, nom_002.jpg…
+_existing_output() {
+  if [[ -e "$OUTPUT" ]]; then echo "$OUTPUT"; return 0; fi
+  if [[ "$OUTPUT" == *.jpg ]]; then
+    local first="${OUTPUT%.jpg}_001.jpg"
+    if [[ -e "$first" ]]; then echo "$first"; fi
+  fi
+  return 0
+}
+
+# Refuse d'écraser un fichier existant sans accord : question si le terminal
+# est interactif, sinon erreur (utiliser -y pour forcer)
+confirm_overwrite() {
+  if $FORCE || $OVERWRITE_OK; then return 0; fi
+  local existing; existing=$(_existing_output)
+  [[ -n "$existing" ]] || return 0
+  if [[ -t 0 ]]; then
+    echo -ne "  ${YELLOW}Le fichier ${BOLD}${existing}${RESET}${YELLOW} existe déjà. L'écraser ?${RESET} ${DIM}[o/N]${RESET} : "
+    read -r _ow
+    if [[ "${_ow,,}" == "o" ]]; then OVERWRITE_OK=true; return 0; fi
+    error "Annulé : ${existing} existe déjà (choisissez un autre nom avec -o, ou -y pour écraser)."
+  fi
+  error "${existing} existe déjà — choisissez un autre nom avec -o, ou ajoutez -y pour l'écraser."
+}
+
+# Réglages par défaut : enchaîne les menus puis enregistre la configuration
+menu_settings() {
+  section "Réglages par défaut"
+  echo -e "    ${DIM}Ces choix seront proposés par défaut à chaque utilisation, et utilisés en ligne de commande.${RESET}"
+  echo -e "    ${DIM}Fichier : ${CONFIG_FILE}${RESET}"
+  menu_device
+  menu_format
+  menu_resolution
+  menu_mode
+  section "Sortie"
+  menu_output_format
+
+  echo -e "  ${BOLD}Dossier de sortie${RESET}"
+  echo -e "  ${DIM}Où ranger les fichiers dont le nom est donné sans dossier. Vide = dossier courant.${RESET}"
+  while true; do
+    ask "Dossier" "${OUTPUT_DIR:-(dossier courant)}"
+    if [[ "$REPLY" == "(dossier courant)" ]] || [[ "$REPLY" == "-" ]]; then OUTPUT_DIR=""; break; fi
+    OUTPUT_DIR=$(_clean_path "$REPLY")
+    if [[ -d "$OUTPUT_DIR" ]]; then break; fi
+    echo -ne "  ${BOLD}→${RESET} ${OUTPUT_DIR} n'existe pas. Le créer ? ${DIM}[O/n]${RESET} : "
+    read -r _mk
+    if [[ "${_mk,,}" != "n" ]] && mkdir -p -- "$OUTPUT_DIR"; then break; fi
+  done
+
+  if [[ "$OUTPUT_FORMAT" == "pdf" ]]; then menu_ocr; fi
+  menu_meta
+  menu_open_result
+  validate_options
+  save_config
+  exit 0
+}
+
+menu_open_result() {
+  echo ""
+  local hint="[o/N]"; if $OPEN_RESULT; then hint="[O/n]"; fi
+  echo -ne "  ${BOLD}→${RESET} Ouvrir le fichier à la fin du traitement ? ${DIM}${hint}${RESET} : "
+  read -r _open
+  if [[ -n "$_open" ]]; then
+    if [[ "${_open,,}" == "o" ]]; then OPEN_RESULT=true; else OPEN_RESULT=false; fi
+  fi
 }
 
 menu_summary() {
   section "Récapitulatif — Prêt à démarrer"
   printf "    %-22s ${CYAN}%s${RESET}\n" "Résolution :"   "${RESOLUTION} dpi"
   printf "    %-22s ${CYAN}%s${RESET}\n" "Mode :"         "$MODE"
+  if [[ -z "$INPUT_FILE" ]]; then printf "    %-22s ${CYAN}%s${RESET}\n" "Format papier :" "$PAPER_FORMAT"; fi
   printf "    %-22s ${CYAN}%s${RESET}\n" "Sortie :"       "$OUTPUT"
   if $MULTI_PAGE; then
     if [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "mode continu (au fil de l'eau)"
+    elif [[ "$MULTI_PAGE_MODE" == "adf" ]]; then
+      printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "chargeur automatique${SCAN_SOURCE:+ ($SCAN_SOURCE)}"
     else
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "$NB_PAGES"
     fi
@@ -429,6 +714,7 @@ menu_summary() {
     *)       _meta_label="conservées" ;;
   esac
   printf "    %-22s ${CYAN}%s${RESET}\n" "Métadonnées :" "$_meta_label"
+  printf "    %-22s ${CYAN}%s${RESET}\n" "Ouvrir à la fin :" "$($OPEN_RESULT && echo 'oui' || echo 'non')"
   echo ""
   echo -ne "  ${BOLD}→${RESET} Lancer maintenant ? ${DIM}[O/n]${RESET} : "
   read -r _confirm
@@ -470,7 +756,8 @@ run_interactive() {
         menu_multipage
         ;;
     4)  list_devices ;;
-    5)  echo "Au revoir !"; exit 0 ;;
+    5)  menu_settings ;;
+    6)  echo "Au revoir !"; exit 0 ;;
   esac
 
   menu_output
@@ -482,7 +769,9 @@ run_interactive() {
   echo -ne "  ${BOLD}→${RESET} Configurer les options avancées ? ${DIM}[o/N]${RESET} : "
   read -r _adv
   if [[ "${_adv,,}" == "o" ]]; then menu_advanced; fi
+  menu_open_result
 
+  validate_options
   menu_summary
   main_process
 }
@@ -517,16 +806,26 @@ ${BOLD}OPTIONS${RESET}
   -M             Supprimer toutes les métadonnées (PDF et JPEG : outils, dates…)
   -p             Mode multi-pages (pause entre chaque page)
   -n <nb>        Nombre de pages en mode multi-pages (défaut: ${NB_PAGES})
+  -a             Chargeur automatique (ADF) : scanne toutes les pages du bac
+  -S <source>    Source SANE explicite (ex: "ADF Duplex", "Flatbed") — voir -l
+  -y             Écraser le fichier de sortie s'il existe déjà
+  -V             Ouvrir le fichier produit à la fin (xdg-open)
   -k             Garder les fichiers temporaires
   -C             Désactiver la compression ghostscript
   -l             Lister les scanners disponibles
   -h             Afficher cette aide
+
+${BOLD}CONFIGURATION${RESET}
+  Réglages par défaut lus dans : ${CONFIG_FILE}
+  (à créer via le menu « Réglages par défaut », ou à la main : CLÉ="valeur").
+  Les options ci-dessus restent prioritaires.
 
 ${BOLD}EXEMPLES${RESET}
   $(basename "$0") -o contrat.pdf
   $(basename "$0") -r 600 -m color -o photo.pdf
   $(basename "$0") -f scan_existant.jpg -m bw -t 60
   $(basename "$0") -p -n 5 -o dossier_complet.pdf
+  $(basename "$0") -a -m bw -o courrier.pdf
 EOF
   exit 0
 }
@@ -541,7 +840,9 @@ list_devices() {
 #  PARSING DES OPTIONS (mode CLI)
 # =============================================================================
 
-while getopts "r:m:o:f:t:w:b:d:F:O:L:n:pkCRMlh" opt; do
+load_config
+
+while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMlh" opt; do
   case $opt in
     r) RESOLUTION="$OPTARG" ;;
     m) MODE="$OPTARG" ;;
@@ -556,7 +857,11 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:pkCRMlh" opt; do
     L) OCR_LANG="$OPTARG" ;;
     n) NB_PAGES="$OPTARG" ;;
     p) MULTI_PAGE=true ;;
+    a) MULTI_PAGE=true; MULTI_PAGE_MODE="adf" ;;
+    S) SCAN_SOURCE="$OPTARG" ;;
     k) KEEP_TEMP=true ;;
+    y) FORCE=true ;;
+    V) OPEN_RESULT=true ;;
     C) COMPRESS=false ;;
     R) OCR=true ;;
     M) STRIP_META=all ;;
@@ -565,6 +870,74 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:pkCRMlh" opt; do
     *) usage ;;
   esac
 done
+
+# =============================================================================
+#  VALIDATION DES OPTIONS (avant tout scan)
+# =============================================================================
+
+# _check_int NOM VALEUR MIN MAX — erreur si VALEUR n'est pas un entier dans [MIN, MAX]
+_check_int() {
+  local name="$1" val="$2" min="$3" max="$4"
+  if [[ ! "$val" =~ ^[0-9]+$ ]] || (( 10#$val < min || 10#$val > max )); then
+    error "${name} invalide : « ${val} » — attendu un entier entre ${min} et ${max}."
+  fi
+}
+
+# Normalise et vérifie toutes les options, pour échouer tout de suite plutôt
+# qu'après un scan.
+validate_options() {
+  MODE="${MODE,,}"
+  case "$MODE" in
+    scan|clean|bw|color) ;;
+    *) error "Mode invalide : « ${MODE} » — valeurs possibles : scan, clean, bw, color." ;;
+  esac
+
+  OUTPUT_FORMAT="${OUTPUT_FORMAT,,}"
+  case "$OUTPUT_FORMAT" in
+    pdf) ;;
+    jpeg|jpg) OUTPUT_FORMAT="jpeg" ;;
+    *) error "Format de sortie invalide : « ${OUTPUT_FORMAT} » — valeurs possibles : pdf, jpeg (ou jpg)." ;;
+  esac
+
+  _check_int "Résolution (-r)"          "$RESOLUTION"   50 4800
+  _check_int "Nombre de pages (-n)"     "$NB_PAGES"     1  999
+  _check_int "Seuil bw (-t)"            "$THRESHOLD"    0  100
+  _check_int "Seuil de blanchiment (-w)" "$WHITE_THRESH" 0  100
+  _check_int "Flou (-b)"                "$BLUR"         0  3
+  _check_int "Qualité JPEG"             "$JPEG_QUALITY" 1  100
+  RESOLUTION=$((10#$RESOLUTION)); NB_PAGES=$((10#$NB_PAGES))
+  THRESHOLD=$((10#$THRESHOLD)); WHITE_THRESH=$((10#$WHITE_THRESH))
+  BLUR=$((10#$BLUR)); JPEG_QUALITY=$((10#$JPEG_QUALITY))
+
+  if [[ ! "$OCR_LANG" =~ ^[a-z_]+(\+[a-z_]+)*$ ]]; then
+    error "Langue OCR invalide : « ${OCR_LANG} » — ex : fra, eng, fra+eng."
+  fi
+
+  normalize_paper_format
+
+  if [[ -n "$INPUT_FILE" ]]; then
+    [[ -f "$INPUT_FILE" ]] || error "Fichier introuvable : $INPUT_FILE"
+    if $MULTI_PAGE; then warn "-f fourni : le mode multi-pages / chargeur est ignoré."; fi
+  fi
+  if [[ -n "$OUTPUT_DIR" ]] && [[ ! -d "$OUTPUT_DIR" ]]; then
+    mkdir -p -- "$OUTPUT_DIR" || error "Impossible de créer le dossier de sortie : ${OUTPUT_DIR}"
+  fi
+  resolve_output
+  if [[ -n "$OUTPUT" ]]; then
+    local out_dir; out_dir=$(dirname -- "$OUTPUT")
+    [[ -d "$out_dir" ]] || error "Dossier de sortie introuvable : ${out_dir}"
+    [[ -w "$out_dir" ]] || error "Dossier de sortie non accessible en écriture : ${out_dir}"
+  fi
+  # -n sans -p : on suppose que plusieurs pages sont voulues
+  if [[ -z "$INPUT_FILE" ]] && ! $MULTI_PAGE && (( NB_PAGES > 1 )); then
+    info "-n ${NB_PAGES} sans -p : mode multi-pages activé."
+    MULTI_PAGE=true
+  fi
+  if $OCR && [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
+    warn "L'OCR ne s'applique qu'au PDF : ignoré pour une sortie JPEG."
+    OCR=false
+  fi
+}
 
 # =============================================================================
 #  SCAN
@@ -590,34 +963,66 @@ _paper_size_opts() {
   return 0
 }
 
-do_scan() {
-  local outfile="$1"
-  local device_opt=""
-  if [[ -n "$DEVICE" ]]; then device_opt="--device-name=$DEVICE"; fi
-
-  # Mode couleur scanimage selon le mode de traitement
-  local scan_mode_opt
-  case "$MODE" in
-    bw) scan_mode_opt="--mode=Gray" ;;
-    *)  scan_mode_opt="--mode=Color" ;;
+# Normalise PAPER_FORMAT (casse, « 210x297 » → « custom:210x297 ») et refuse
+# les valeurs inconnues, avant tout scan.
+normalize_paper_format() {
+  local f="$PAPER_FORMAT"
+  f="${f#custom:}"
+  case "${f,,}" in
+    auto)   PAPER_FORMAT="auto" ;;
+    a4)     PAPER_FORMAT="A4" ;;
+    a5)     PAPER_FORMAT="A5" ;;
+    letter) PAPER_FORMAT="Letter" ;;
+    legal)  PAPER_FORMAT="Legal" ;;
+    *)
+      if [[ "${f,,}" =~ ^[0-9]+([.][0-9]+)?x[0-9]+([.][0-9]+)?$ ]]; then
+        PAPER_FORMAT="custom:${f,,}"
+      else
+        error "Format papier invalide : ${PAPER_FORMAT}\n  → Valeurs possibles : auto, A4, A5, Letter, Legal, ou LxH en mm (ex : 210x297)"
+      fi
+      ;;
   esac
+}
 
-  # Dimensions de la zone de scan
+# Options scanimage communes au scan simple et au chargeur : scanner, source,
+# mode couleur, zone de scan, format et résolution — résultat dans SCAN_OPTS
+_scan_opts() {
+  SCAN_OPTS=()
+  if [[ -n "$DEVICE" ]]; then SCAN_OPTS+=("--device-name=$DEVICE"); fi
+  if [[ -n "$SCAN_SOURCE" ]]; then SCAN_OPTS+=("--source=$SCAN_SOURCE"); fi
+  case "$MODE" in
+    bw) SCAN_OPTS+=("--mode=Gray") ;;
+    *)  SCAN_OPTS+=("--mode=Color") ;;
+  esac
   local size_opts
   size_opts=$(_paper_size_opts)
+  # shellcheck disable=SC2206
+  SCAN_OPTS+=($size_opts "--format=pnm" "--resolution=$RESOLUTION")
+}
+
+# En mode auto : recadrage automatique des bandes noires/vides en bordure
+_auto_trim() {
+  local file="$1"
+  [[ "$PAPER_FORMAT" == "auto" ]] || return 0
+  local trimmed
+  trimmed=$(mktemp --suffix=.pnm)
+  if convert "$file" -fuzz 8% -trim +repage "$trimmed" 2>/dev/null; then
+    mv "$trimmed" "$file"
+  else
+    rm -f "$trimmed"
+    warn "Recadrage automatique échoué, image conservée telle quelle."
+  fi
+}
+
+do_scan() {
+  local outfile="$1"
+  _scan_opts
 
   info "Scan en cours (${RESOLUTION} dpi, format ${PAPER_FORMAT}, mode ${MODE})..."
 
   local scan_err
   scan_err=$(mktemp)
-  # shellcheck disable=SC2086
-  if ! scanimage \
-      $device_opt \
-      $scan_mode_opt \
-      $size_opts \
-      --format="pnm" \
-      --resolution="$RESOLUTION" \
-      > "$outfile" 2>"$scan_err"; then
+  if ! scanimage "${SCAN_OPTS[@]}" > "$outfile" 2>"$scan_err"; then
     local msg
     msg=$(cat "$scan_err")
     rm -f "$scan_err"
@@ -625,21 +1030,83 @@ do_scan() {
   fi
   rm -f "$scan_err"
 
-  # En mode auto : recadrage automatique des bandes noires/vides en bordure
   if [[ "$PAPER_FORMAT" == "auto" ]]; then
     info "Recadrage automatique des bords..."
-    local trimmed
-    trimmed=$(mktemp --suffix=.pnm)
-    if convert "$outfile" -fuzz 8% -trim +repage "$trimmed" 2>/dev/null; then
-      mv "$trimmed" "$outfile"
-      success "Recadrage effectué."
-    else
-      rm -f "$trimmed"
-      warn "Recadrage automatique échoué, image conservée telle quelle."
-    fi
+    _auto_trim "$outfile"
   fi
 
   success "Scan terminé → $outfile"
+}
+
+# Cherche dans les options du scanner une source de type chargeur (ADF / Feeder).
+# Privilégie le recto simple ; affiche la source trouvée, rien sinon.
+_detect_adf_source() {
+  local dev_opts=()
+  if [[ -n "$DEVICE" ]]; then dev_opts+=("--device-name=$DEVICE"); fi
+  local line
+  line=$(scanimage "${dev_opts[@]}" -A 2>/dev/null | grep -m1 -E '^[[:space:]]*--source' || true)
+  [[ -n "$line" ]] || return 0
+  # Ex : "    --source Flatbed|ADF|ADF Duplex [Flatbed]"
+  line="${line#*--source }"
+  line="${line%% \[*}"
+  local IFS='|' src candidates=()
+  read -ra candidates <<< "$line"
+  for src in "${candidates[@]}"; do
+    if [[ "${src,,}" =~ (adf|feeder) ]] && [[ ! "${src,,}" =~ duplex ]]; then echo "$src"; return 0; fi
+  done
+  for src in "${candidates[@]}"; do
+    if [[ "${src,,}" =~ (adf|feeder) ]]; then echo "$src"; return 0; fi
+  done
+}
+
+# Scan de tout le bac du chargeur en une seule commande (scanimage --batch).
+# Remplit PAGES avec les pages traitées.
+do_scan_adf() {
+  local tmpdir="$1"
+
+  if [[ -z "$SCAN_SOURCE" ]]; then
+    SCAN_SOURCE=$(_detect_adf_source)
+    if [[ -n "$SCAN_SOURCE" ]]; then
+      info "Source chargeur détectée : ${SCAN_SOURCE}"
+    else
+      warn "Aucune source « ADF » détectée : le scanner utilisera sa source par défaut."
+      echo -e "    ${DIM}Pour la forcer : -S \"<source>\" (voir « scanimage -A »).${RESET}"
+    fi
+  fi
+  _scan_opts
+
+  info "Scan du chargeur en cours (${RESOLUTION} dpi, format ${PAPER_FORMAT}, mode ${MODE})..."
+  local scan_err
+  scan_err=$(mktemp)
+  # Le code retour de scanimage n'est pas fiable en mode batch (« plus de
+  # documents » en fin de bac) : on juge sur les pages réellement produites.
+  scanimage "${SCAN_OPTS[@]}" --batch="${tmpdir}/adf_%03d.pnm" 2>"$scan_err" || true
+
+  local raw=()
+  shopt -s nullglob
+  raw=("${tmpdir}"/adf_*.pnm)
+  shopt -u nullglob
+  # Une page vide (0 octet) peut être laissée par un bourrage ou un bac vide
+  local f pages_ok=()
+  for f in "${raw[@]}"; do [[ -s "$f" ]] && pages_ok+=("$f"); done
+
+  if [[ ${#pages_ok[@]} -eq 0 ]]; then
+    local msg; msg=$(grep -v '^Scanning\|^Scanned' "$scan_err" || true)
+    rm -f "$scan_err"
+    error "Aucune page scannée depuis le chargeur : ${msg:-erreur inconnue}\n  → Vérifiez que les pages sont dans le bac et que le scanner a un chargeur (-S pour choisir la source)."
+  fi
+  rm -f "$scan_err"
+  success "${#pages_ok[@]} page(s) scannée(s) depuis le chargeur."
+
+  local n=0
+  for f in "${pages_ok[@]}"; do
+    n=$(( n + 1 ))
+    echo -e "${BOLD}--- Page ${n}/${#pages_ok[@]} ---${RESET}"
+    _auto_trim "$f"
+    local proc_tmp="${tmpdir}/page_${n}_processed.$(_page_ext)"
+    do_process "$f" "$proc_tmp"
+    PAGES+=("$proc_tmp")
+  done
 }
 
 # =============================================================================
@@ -687,6 +1154,17 @@ do_process() {
       ;;
   esac
 
+  # Résolution : sans elle, ImageMagick suppose 72 dpi et la page du PDF
+  # devient gigantesque (A4 à 300 dpi → 87 × 124 cm). Le PNM (scan, PDF source)
+  # ne porte aucune résolution ; pour une image, on garde la sienne si elle existe.
+  local units=""
+  if [[ "$infile" != *.pnm ]]; then
+    units=$(identify -format '%U' "${infile}[0]" 2>/dev/null || true)
+  fi
+  if [[ -z "$units" ]] || [[ "$units" == "Undefined" ]]; then
+    im_args+=("-units" "PixelsPerInch" "-density" "$RESOLUTION")
+  fi
+
   # Qualité JPEG si applicable
   if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
     im_args+=("-quality" "$JPEG_QUALITY")
@@ -698,12 +1176,16 @@ do_process() {
   success "Post-traitement terminé → $outfile"
 }
 
-menu_meta() {
-  local _needs_exiftool=false
-  if [[ "$OUTPUT_FORMAT" == "jpeg" ]] && ! command -v exiftool &>/dev/null; then
-    _needs_exiftool=true
-  fi
+# Outils de nettoyage PDF manquants (exiftool : XMP et Producer ; qpdf : réécrit
+# le fichier pour que les anciennes valeurs ne soient plus récupérables)
+_missing_pdf_meta_tools() {
+  local m=()
+  command -v exiftool &>/dev/null || m+=("libimage-exiftool-perl")
+  command -v qpdf     &>/dev/null || m+=("qpdf")
+  echo "${m[*]}"
+}
 
+menu_meta() {
   while true; do
     section "Métadonnées"
     if [[ "$OUTPUT_FORMAT" == "pdf" ]]; then
@@ -714,10 +1196,12 @@ menu_meta() {
     fi
     echo -e "    ${DIM}Les supprimer améliore la confidentialité du fichier.${RESET}"
     echo ""
-    print_opt "1" "Supprimer tout"            "Outils, dates, tous les champs vidés"
-    print_opt "2" "Supprimer sauf les dates"  "Vide l'outil source, conserve CreationDate/ModDate"
-    print_opt "3" "Conserver"                 "Métadonnées préservées"  "true"
-    ask_choice "Votre choix" "3" "3"
+    local def=3
+    case "$STRIP_META" in all) def=1 ;; nodates) def=2 ;; esac
+    print_opt "1" "Supprimer tout"            "Outils, dates, tous les champs vidés"                 "$([[ $def == 1 ]] && echo true)"
+    print_opt "2" "Supprimer sauf les dates"  "Vide l'outil source, conserve CreationDate/ModDate"  "$([[ $def == 2 ]] && echo true)"
+    print_opt "3" "Conserver"                 "Métadonnées préservées"                               "$([[ $def == 3 ]] && echo true)"
+    ask_choice "Votre choix" "$def" "3"
     case "$REPLY" in
       1) STRIP_META="all" ;;
       2) STRIP_META="nodates" ;;
@@ -729,23 +1213,26 @@ menu_meta() {
       break
     fi
 
-    # PDF sans exiftool : simple avertissement, pas bloquant (GS fait quand même le travail)
-    if [[ "$OUTPUT_FORMAT" == "pdf" ]] && ! command -v exiftool &>/dev/null; then
+    # PDF : exiftool et qpdf recommandés, pas bloquants
+    if [[ "$OUTPUT_FORMAT" == "pdf" ]]; then
+      local missing; missing=$(_missing_pdf_meta_tools)
+      [[ -z "$missing" ]] && break
       echo ""
-      warn "exiftool non installé : le champ Producer (Ghostscript) restera présent."
-      echo -e "    ${DIM}Pour une suppression complète : ${BOLD}sudo apt install libimage-exiftool-perl${RESET}"
+      warn "Outils manquants pour une suppression complète : ${missing}"
+      echo -e "    ${DIM}Sans eux, le champ Producer (Ghostscript) ou d'anciennes valeurs peuvent rester.${RESET}"
       echo ""
-      print_opt "1" "Continuer sans exiftool"   "Producer GS restera, le reste sera supprimé"  "true"
-      print_opt "2" "Installer exiftool d'abord" "sudo apt install libimage-exiftool-perl"
-      print_opt "3" "Revenir au choix précédent" ""
+      print_opt "1" "Installer maintenant"        "sudo apt install ${missing}"  "true"
+      print_opt "2" "Continuer sans"              "Suppression partielle"
+      print_opt "3" "Revenir au choix précédent"  ""
       ask_choice "Votre choix" "1" "3"
       case "$REPLY" in
-        1) break ;;
-        2)
-          sudo apt install -y libimage-exiftool-perl \
-            && { success "exiftool installé."; break; } \
-            || { warn "Installation échouée."; continue; }
+        1)
+          # shellcheck disable=SC2086
+          if sudo apt install -y $missing; then success "Outils installés."; break; fi
+          warn "Installation échouée."
+          continue
           ;;
+        2) break ;;
         3) continue ;;
       esac
     fi
@@ -761,14 +1248,13 @@ menu_meta() {
       ask_choice "Votre choix" "1" "2"
       case "$REPLY" in
         1)
-          sudo apt install -y libimage-exiftool-perl \
-            && { success "exiftool installé."; break; } \
-            || { warn "Installation échouée."; continue; }
+          if sudo apt install -y libimage-exiftool-perl; then success "exiftool installé."; break; fi
+          warn "Installation échouée."
+          continue
           ;;
         2) continue ;;
       esac
     else
-      # Tout est OK
       break
     fi
   done
@@ -788,15 +1274,16 @@ menu_ocr() {
   echo -e "    ${DIM}Résultat : texte copié-collable, recherche Ctrl+F, lecture par les lecteurs d'écran.${RESET}"
   echo ""
 
+  local def=2; if $OCR; then def=1; fi
   if ! command -v ocrmypdf &>/dev/null; then
-    print_opt "1" "Activer l'OCR"   "Installe ocrmypdf automatiquement"
-    print_opt "2" "Sans OCR"        "PDF image uniquement"  "true"
+    print_opt "1" "Activer l'OCR"   "Installe ocrmypdf automatiquement"  "$([[ $def == 1 ]] && echo true)"
   else
-    print_opt "1" "Activer l'OCR"   "PDF consultable avec texte intégré"
-    print_opt "2" "Sans OCR"        "PDF image uniquement"  "true"
+    print_opt "1" "Activer l'OCR"   "PDF consultable avec texte intégré"  "$([[ $def == 1 ]] && echo true)"
   fi
-  ask_choice "Votre choix" "2" "2"
+  print_opt "2" "Sans OCR"        "PDF image uniquement"  "$([[ $def == 2 ]] && echo true)"
+  ask_choice "Votre choix" "$def" "2"
 
+  OCR=false
   if [[ "$REPLY" == "1" ]]; then
     OCR=true
     if ! command -v ocrmypdf &>/dev/null; then
@@ -809,17 +1296,23 @@ menu_ocr() {
     echo -e "  ${DIM}Utilisez les codes ISO : fra (français), eng (anglais), deu (allemand), spa (espagnol)…${RESET}"
     echo -e "  ${DIM}Plusieurs langues possibles : fra+eng${RESET}"
     echo ""
-    print_opt "1" "Français"            "fra"        "true"
-    print_opt "2" "Anglais"             "eng"
-    print_opt "3" "Français + Anglais"  "fra+eng"
-    print_opt "4" "Autre"               "Saisir manuellement"
-    ask_choice "Langue" "1" "4"
+    local ldef=4
+    case "$OCR_LANG" in fra) ldef=1 ;; eng) ldef=2 ;; fra+eng) ldef=3 ;; esac
+    print_opt "1" "Français"            "fra"      "$([[ $ldef == 1 ]] && echo true)"
+    print_opt "2" "Anglais"             "eng"      "$([[ $ldef == 2 ]] && echo true)"
+    print_opt "3" "Français + Anglais"  "fra+eng"  "$([[ $ldef == 3 ]] && echo true)"
+    print_opt "4" "Autre"               "Saisir manuellement$([[ $ldef == 4 ]] && echo " (actuel : ${OCR_LANG})")"  "$([[ $ldef == 4 ]] && echo true)"
+    ask_choice "Langue" "$ldef" "4"
     case "$REPLY" in
       1) OCR_LANG="fra" ;;
       2) OCR_LANG="eng" ;;
       3) OCR_LANG="fra+eng" ;;
       4)
-        ask "Code(s) de langue" "fra"
+        while true; do
+          ask "Code(s) de langue" "$OCR_LANG"
+          if [[ "$REPLY" =~ ^[a-z_]+(\+[a-z_]+)*$ ]]; then break; fi
+          warn "Format attendu : codes en minuscules séparés par + (ex : fra+deu)."
+        done
         OCR_LANG="$REPLY"
         ;;
     esac
@@ -908,8 +1401,9 @@ do_strip_meta() {
         || warn "exiftool : suppression partielle."
     else
       # nodates : supprimer tout sauf les dates
-      exiftool -q -all= \
-        --DateTimeOriginal --CreateDate --ModifyDate --DateTime \
+      # -all= vide tout, -tagsFromFile @ recopie ensuite les dates d'origine
+      exiftool -q -all= -tagsFromFile @ \
+        -DateTimeOriginal -CreateDate -ModifyDate \
         -overwrite_original "$outfile" 2>/dev/null \
         || warn "exiftool : suppression partielle."
     fi
@@ -976,12 +1470,33 @@ PDFMARKS
         || warn "exiftool : suppression partielle des métadonnées XMP."
     else
       # nodates : exclure les tags de date de la suppression
-      exiftool -q -all= \
-        --CreateDate --ModifyDate --DateTime \
-        --XMP:CreateDate --XMP:ModifyDate --XMP:MetadataDate \
+      # nodates : -all= vide tout le dictionnaire PDF (les exclusions --Tag n'y
+      # suffisent pas), -tagsFromFile @ recopie ensuite les dates
+      exiftool -q -all= -tagsFromFile @ \
+        -PDF:CreateDate -PDF:ModifyDate -XMP:CreateDate -XMP:ModifyDate \
         -overwrite_original "$outfile" 2>/dev/null \
         || warn "exiftool : suppression partielle des métadonnées XMP."
     fi
+  fi
+
+  # Passage 3 : qpdf — exiftool modifie le PDF par ajout (les anciennes valeurs
+  # restent dans le fichier et « exiftool -PDF-update:all= » les restaure).
+  # qpdf réécrit le fichier avec les seuls objets utilisés : elles disparaissent.
+  if command -v qpdf &>/dev/null; then
+    local qpdf_out
+    qpdf_out=$(mktemp --suffix=.pdf)
+    # Code 3 = avertissements seulement : le fichier produit est valide
+    local rc=0
+    qpdf --object-streams=generate "$outfile" "$qpdf_out" 2>/dev/null || rc=$?
+    if [[ $rc -eq 0 || $rc -eq 3 ]] && [[ -s "$qpdf_out" ]]; then
+      mv "$qpdf_out" "$outfile"
+    else
+      rm -f "$qpdf_out"
+      warn "qpdf : réécriture échouée, d'anciennes valeurs peuvent rester récupérables."
+    fi
+  elif command -v exiftool &>/dev/null; then
+    warn "qpdf absent : les anciennes métadonnées restent récupérables dans le fichier."
+    echo -e "    ${DIM}Pour une suppression définitive : ${BOLD}sudo apt install qpdf${RESET}"
   fi
 
   success "Métadonnées PDF supprimées."
@@ -1014,56 +1529,52 @@ do_compress() {
 #  SCAN MULTI-PAGES
 # =============================================================================
 
+# Extension des pages traitées : JPEG en sortie JPEG ; sinon MIFF, format
+# interne sans perte qui conserve la résolution, assemblé ensuite en un seul
+# PDF (assembler des PDF avec convert les re-rastériserait à 72 dpi).
+_page_ext() {
+  if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then echo "jpg"; else echo "miff"; fi
+}
+
+# Scanne puis traite une page ; ajoute le résultat à PAGES
+_scan_page() {
+  local tmpdir="$1" num="$2"
+  local scan_tmp="${tmpdir}/page_${num}.pnm"
+  local proc_tmp="${tmpdir}/page_${num}_processed.$(_page_ext)"
+  do_scan "$scan_tmp"
+  do_process "$scan_tmp" "$proc_tmp"
+  PAGES+=("$proc_tmp")
+}
+
 do_multi_page() {
   local tmpdir="$1"
-  local pages=()
   local page_num=0
-  local proc_ext; if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then proc_ext="jpg"; else proc_ext="pdf"; fi
 
-  if [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
+  if [[ "$MULTI_PAGE_MODE" == "adf" ]]; then
+    do_scan_adf "$tmpdir"
+  elif [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
     while true; do
       page_num=$(( page_num + 1 ))
       echo ""
       echo -e "${BOLD}--- Page ${page_num} ---${RESET}"
-      local scan_tmp="${tmpdir}/page_${page_num}.pnm"
-      local proc_tmp="${tmpdir}/page_${page_num}_processed.${proc_ext}"
+      _scan_page "$tmpdir" "$page_num"
 
-      do_scan "$scan_tmp"
-      do_process "$scan_tmp" "$proc_tmp"
-      pages+=("$proc_tmp")
-
-      echo -ne "\n  ${BOLD}→${RESET} Scanner une autre page ? ${DIM}[O/n]${RESET} : "
+      echo -e "\n  ${DIM}Pour continuer, placez la page suivante dans le scanner avant de répondre.${RESET}"
+      echo -ne "  ${BOLD}→${RESET} Scanner une autre page ? ${DIM}[O/n]${RESET} : "
       read -r _more
       if [[ "${_more,,}" == "n" ]]; then break; fi
-      echo -e "  ${DIM}Placez la page suivante dans le scanner, puis appuyez sur Entrée pour continuer...${RESET}"
     done
   else
     for (( i=1; i<=NB_PAGES; i++ )); do
       echo ""
       echo -e "${BOLD}--- Page ${i}/${NB_PAGES} ---${RESET}"
-      local scan_tmp="${tmpdir}/page_${i}.pnm"
-      local proc_tmp="${tmpdir}/page_${i}_processed.${proc_ext}"
-
-      do_scan "$scan_tmp"
-      do_process "$scan_tmp" "$proc_tmp"
-      pages+=("$proc_tmp")
+      _scan_page "$tmpdir" "$i"
 
       if [[ $i -lt $NB_PAGES ]]; then
         echo -e "\n  ${YELLOW}Placez la page suivante dans le scanner, puis appuyez sur ENTRÉE...${RESET}"
         read -r
       fi
     done
-    page_num=$NB_PAGES
-  fi
-
-  if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
-    MULTI_PAGE_FILES=("${pages[@]}")
-    MERGED_PDF=""
-  else
-    info "Assemblage des ${page_num} pages..."
-    convert "${pages[@]}" "${tmpdir}/merged.pdf" \
-      || error "Échec de l'assemblage des pages"
-    MERGED_PDF="${tmpdir}/merged.pdf"
   fi
 }
 
@@ -1075,116 +1586,132 @@ main_process() {
   # Extension selon le format de sortie
   local ext; if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then ext="jpg"; else ext="pdf"; fi
 
-  if [[ -z "$OUTPUT" ]]; then OUTPUT="scan_$(date +%Y%m%d_%H%M%S).${ext}"; fi
-  OUTPUT="${OUTPUT%.*}.${ext}"
+  resolve_output
+  confirm_overwrite
 
   SCAN_TMPDIR=$(mktemp -d /tmp/scan-doc-XXXXXX)
   local tmpdir="$SCAN_TMPDIR"
   if $KEEP_TEMP; then info "Fichiers temporaires dans : $tmpdir"; fi
   if ! $KEEP_TEMP; then trap 'rm -rf "$SCAN_TMPDIR"' EXIT; fi
 
-  local source_file
+  PAGES=()
 
-  # --- Étape 1 : Source (scan ou fichier existant) --------------------------
+  # --- Étapes 1 et 2 : source (scan ou fichier existant) + post-traitement ---
   if [[ -n "$INPUT_FILE" ]]; then
     [[ -f "$INPUT_FILE" ]] || error "Fichier introuvable : $INPUT_FILE"
     info "Source : $INPUT_FILE"
 
-    if [[ "$INPUT_FILE" == *.pdf ]] || [[ "$INPUT_FILE" == *.PDF ]]; then
+    local sources=()
+    if [[ "${INPUT_FILE,,}" == *.pdf ]]; then
       info "Conversion PDF → PNM (${RESOLUTION} dpi, ${DEPTH}-bit)..."
-      convert -density "$RESOLUTION" -depth "$DEPTH" "$INPUT_FILE" "${tmpdir}/source.pnm" \
+      # %03d : une image par page, numérotée dans l'ordre
+      convert -density "$RESOLUTION" -depth "$DEPTH" "$INPUT_FILE" "${tmpdir}/source-%03d.pnm" \
         || error "Échec de la conversion PDF"
-      source_file="${tmpdir}/source.pnm"
+      sources=("${tmpdir}"/source-*.pnm)
+      [[ -f "${sources[0]}" ]] || error "Aucune page extraite de : $INPUT_FILE"
+      if [[ ${#sources[@]} -gt 1 ]]; then info "${#sources[@]} pages détectées."; fi
     else
-      source_file="$INPUT_FILE"
+      sources=("$INPUT_FILE")
     fi
+
+    local n=0 src
+    for src in "${sources[@]}"; do
+      n=$(( n + 1 ))
+      local proc_tmp="${tmpdir}/page_${n}_processed.$(_page_ext)"
+      do_process "$src" "$proc_tmp"
+      PAGES+=("$proc_tmp")
+    done
 
   elif $MULTI_PAGE; then
-    MERGED_PDF=""; MULTI_PAGE_FILES=()
     do_multi_page "$tmpdir"
-    if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
-      local base="${OUTPUT%.jpg}"
-      local total="${#MULTI_PAGE_FILES[@]}"
-      local idx=1
-      for f in "${MULTI_PAGE_FILES[@]}"; do
-        local dest
-        printf -v dest "%s_%03d.jpg" "$base" "$idx"
-        cp "$f" "$dest"
-        if [[ "$STRIP_META" != "false" ]]; then
-          local stripped_jpg="${tmpdir}/stripped_${idx}.jpg"
-          do_strip_meta "$dest" "$stripped_jpg"
-          mv "$stripped_jpg" "$dest"
-        fi
-        success "Page ${idx} → ${dest}"
-        idx=$(( idx + 1 ))
-      done
-      local last; printf -v last "%s_%03d.jpg" "$base" "$total"
-      echo ""
-      echo -e "${GREEN}${BOLD}✓ Terminé !${RESET}"
-      echo -e "  ${total} fichier(s) JPEG : ${BOLD}${base}_001.jpg${RESET} … ${BOLD}${last}${RESET}"
-      echo ""
-    else
-      local pre_ocr
-      if $OCR; then
-        pre_ocr="${tmpdir}/pre_ocr.pdf"
-        if $COMPRESS; then
-          do_compress "$MERGED_PDF" "$pre_ocr"
-        else
-          cp "$MERGED_PDF" "$pre_ocr"
-        fi
-        do_ocr "$pre_ocr" "$OUTPUT"
-      elif $COMPRESS; then
-        do_compress "$MERGED_PDF" "$OUTPUT"
-      else
-        cp "$MERGED_PDF" "$OUTPUT"
-      fi
-      if [[ "$STRIP_META" != "false" ]]; then
-        local pre_strip_mp="${tmpdir}/pre_strip_mp.pdf"
-        mv "$OUTPUT" "$pre_strip_mp"
-        do_strip_meta "$pre_strip_mp" "$OUTPUT"
-      fi
-      _print_done
-    fi
-    return
 
   else
-    source_file="${tmpdir}/scan_raw.pnm"
-    do_scan "$source_file"
+    _scan_page "$tmpdir" 1
   fi
-
-  # --- Étape 2 : Post-traitement --------------------------------------------
-  local processed_out="${tmpdir}/processed.${ext}"
-  do_process "$source_file" "$processed_out"
 
   # --- Étape 3 : Finalisation -----------------------------------------------
   if [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
-    cp "$processed_out" "$OUTPUT"
-    if [[ "$STRIP_META" != "false" ]]; then
-      local stripped_jpg="${tmpdir}/stripped.jpg"
-      do_strip_meta "$OUTPUT" "$stripped_jpg"
-      mv "$stripped_jpg" "$OUTPUT"
-    fi
-  elif $OCR; then
-    local pre_ocr="${tmpdir}/pre_ocr.pdf"
-    if $COMPRESS; then
-      do_compress "$processed_out" "$pre_ocr"
-    else
-      cp "$processed_out" "$pre_ocr"
-    fi
-    do_ocr "$pre_ocr" "$OUTPUT"
-  elif $COMPRESS; then
-    do_compress "$processed_out" "$OUTPUT"
-  else
-    cp "$processed_out" "$OUTPUT"
+    _finalize_jpeg "$tmpdir"
+    return
   fi
 
-  if [[ "$OUTPUT_FORMAT" == "pdf" ]] && [[ "$STRIP_META" != "false" ]]; then
+  info "Création du PDF (${#PAGES[@]} page(s))..."
+  local merged="${tmpdir}/merged.pdf"
+  local pdf_args=()
+  if [[ "$MODE" == "bw" ]]; then
+    # Image 1 bit compressée en CCITT Group4 (format fax) : PDF noir et
+    # blanc bien plus léger, sans perte
+    pdf_args=("-type" "bilevel" "-compress" "Group4")
+  fi
+  convert "${PAGES[@]}" "${pdf_args[@]}" "$merged" || error "Échec de la création du PDF"
+
+  # Le noir et blanc est déjà en Group4 : Ghostscript ne ferait que le ré-encoder
+  # en plus gros
+  local compress=$COMPRESS
+  if $compress && [[ "$MODE" == "bw" ]]; then
+    info "Noir et blanc déjà compressé en Group4 : compression Ghostscript inutile."
+    compress=false
+  fi
+
+  if $OCR; then
+    local pre_ocr="${tmpdir}/pre_ocr.pdf"
+    if $compress; then
+      do_compress "$merged" "$pre_ocr"
+    else
+      cp "$merged" "$pre_ocr"
+    fi
+    do_ocr "$pre_ocr" "$OUTPUT"
+  elif $compress; then
+    do_compress "$merged" "$OUTPUT"
+  else
+    cp "$merged" "$OUTPUT"
+  fi
+
+  if [[ "$STRIP_META" != "false" ]]; then
     local pre_strip="${tmpdir}/pre_strip.pdf"
     mv "$OUTPUT" "$pre_strip"
     do_strip_meta "$pre_strip" "$OUTPUT"
   fi
 
   _print_done
+}
+
+# Sortie JPEG : un fichier pour une page, nom_001.jpg, nom_002.jpg… sinon
+_finalize_jpeg() {
+  local tmpdir="$1"
+  local total="${#PAGES[@]}"
+
+  if [[ $total -eq 1 ]]; then
+    cp "${PAGES[0]}" "$OUTPUT"
+    if [[ "$STRIP_META" != "false" ]]; then
+      local stripped_jpg="${tmpdir}/stripped.jpg"
+      do_strip_meta "$OUTPUT" "$stripped_jpg"
+      mv "$stripped_jpg" "$OUTPUT"
+    fi
+    _print_done
+    return
+  fi
+
+  local base="${OUTPUT%.jpg}"
+  local idx=1 f
+  for f in "${PAGES[@]}"; do
+    local dest
+    printf -v dest "%s_%03d.jpg" "$base" "$idx"
+    cp "$f" "$dest"
+    if [[ "$STRIP_META" != "false" ]]; then
+      local stripped_jpg="${tmpdir}/stripped_${idx}.jpg"
+      do_strip_meta "$dest" "$stripped_jpg"
+      mv "$stripped_jpg" "$dest"
+    fi
+    success "Page ${idx} → ${dest}"
+    idx=$(( idx + 1 ))
+  done
+  local last; printf -v last "%s_%03d.jpg" "$base" "$total"
+  echo ""
+  echo -e "${GREEN}${BOLD}✓ Terminé !${RESET}"
+  echo -e "  ${total} fichier(s) JPEG : ${BOLD}${base}_001.jpg${RESET} … ${BOLD}${last}${RESET}"
+  echo ""
+  if $OPEN_RESULT; then _open_result "${base}_001.jpg"; fi
 }
 
 _print_done() {
@@ -1194,6 +1721,7 @@ _print_done() {
   echo -e "${GREEN}${BOLD}✓ Terminé !${RESET}"
   echo -e "  Fichier : ${BOLD}${OUTPUT}${RESET}  (${final_size})"
   echo ""
+  if $OPEN_RESULT; then _open_result "$OUTPUT"; fi
 }
 
 # =============================================================================
@@ -1205,6 +1733,7 @@ if [[ $# -eq 0 ]]; then
   run_interactive
 else
   # Arguments CLI → mode direct (comportement d'origine)
+  validate_options
   check_deps
   main_process
 fi
