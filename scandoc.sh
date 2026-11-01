@@ -50,6 +50,7 @@ MULTI_PAGE=false        # Scan multi-pages avec pause entre chaque page
 NB_PAGES=1              # Nombre de pages (mode multi-pages)
 MULTI_PAGE_MODE="fixed" # Mode multi-pages : fixed (nombre connu) | auto (continu jusqu'à stop) | adf (chargeur)
 SCAN_SOURCE=""          # Source SANE (ex : "ADF", "Flatbed") — auto-détectée en mode adf si vide
+DUPLEX=false            # Recto verso avec le chargeur (-2 / --recto-verso)
 KEEP_TEMP=false         # Garder les fichiers temporaires (debug)
 COMPRESS=true           # Compresser le PDF final avec ghostscript
 DEPTH=8                 # Profondeur de couleur (8=standard, 16=haute fidélité)
@@ -65,6 +66,17 @@ OPEN_RESULT=false       # Ouvrir le fichier produit à la fin (xdg-open / open)
 FORCE=false             # Écraser un fichier existant sans demander (-y)
 OVERWRITE_OK=false      # Écrasement déjà confirmé (mode interactif)
 CONFIG_FILE="${SCANDOC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/scandoc.conf}"
+INTERACTIVE=false       # true en mode interactif (menus) : on peut poser des questions
+DIAGNOSTIC=false        # -D / --diagnostic : afficher les capacités des scanners et quitter
+LIST_ONLY=false         # -l : lister les scanners et quitter
+
+# Capacités du scanner, lues une fois avec « scanimage -A » (voir prepare_scanner)
+SCANNER_CAPS=""         # Sortie de « scanimage -A » pour le scanner et la source choisis
+CAPS_KEY=""             # « scanner|source » pour lesquels SCANNER_CAPS a été lu (cache)
+CAPS_OK=false           # true si les options du scanner ont pu être lues
+SCAN_MODE_NAME="Color"  # Valeur passée à --mode, dans le vocabulaire du pilote (vide : pas de --mode)
+SCAN_RES_OPT=true       # false si le scanner n'a pas d'option --resolution
+SCAN_SIZE_OPTS=()       # Options -x / -y, limitées à la zone maximale du scanner
 
 # =============================================================================
 #  VÉRIFICATION DES DÉPENDANCES
@@ -342,7 +354,7 @@ menu_main() {
   print_opt "1" "Scanner un document"              "Utilise le scanner connecté au système"          "true"
   print_opt "2" "Traiter un fichier existant"      "Image ou PDF déjà présent sur le disque"
   print_opt "3" "Scanner plusieurs pages"          "Pause entre chaque page, PDF assemblé automatiquement"
-  print_opt "4" "Lister les scanners disponibles"  "Affiche les scanners détectés par SANE"
+  print_opt "4" "Diagnostic des scanners"          "Scanners détectés et réglages qu'ils acceptent"
   print_opt "5" "Réglages par défaut"              "Scanner, résolution, mode, dossier… mémorisés pour la suite"
   print_opt "6" "Quitter"                          ""
   ask_choice "Votre choix" "1" "6"
@@ -372,8 +384,8 @@ menu_device() {
   section "Scanner à utiliser"
   local def=1 max=2
   if [[ -n "$DEVICE" ]]; then def=3; max=3; fi
-  print_opt "1" "Auto-détection (conseillé)"  "Laisse SANE choisir le scanner disponible"  "$([[ $def == 1 ]] && echo true)"
-  print_opt "2" "Saisir manuellement"          "Entrer l'identifiant SANE du scanner"
+  print_opt "1" "Auto-détection (conseillé)"  "Le scanner détecté, ou un choix proposé s'il y en a plusieurs"  "$([[ $def == 1 ]] && echo true)"
+  print_opt "2" "Choisir dans la liste"        "Scanners détectés par SANE, ou saisie de l'identifiant"
   if [[ -n "$DEVICE" ]]; then
     print_opt "3" "Scanner enregistré"         "$DEVICE"  "true"
   fi
@@ -383,11 +395,18 @@ menu_device() {
     DEVICE=""
   elif [[ "$REPLY" == "2" ]]; then
     echo ""
-    info "Scanners détectés sur ce système :"
-    scanimage -L 2>/dev/null || warn "Aucun scanner détecté (vérifiez la connexion USB/réseau)."
-    echo ""
-    ask "Identifiant du scanner (ex: brother5:net1;dev0)" ""
-    if [[ -n "$REPLY" ]]; then DEVICE="$REPLY"; fi
+    local lines=()
+    mapfile -t lines < <(_list_scanners)
+    if [[ ${#lines[@]} -eq 0 ]] && _offer_airscan; then mapfile -t lines < <(_list_scanners); fi
+    if [[ ${#lines[@]} -eq 0 ]]; then
+      warn "Aucun scanner détecté."
+      _no_scanner_hint
+      echo ""
+      ask "Identifiant du scanner (ex: brother5:net1;dev0), vide = auto-détection" ""
+      DEVICE="$REPLY"
+      return 0
+    fi
+    _choose_scanner "${lines[@]}"
   fi
 }
 
@@ -492,7 +511,15 @@ menu_multipage() {
     success "Mode continu : vous serez invité après chaque page."
   else
     MULTI_PAGE_MODE="adf"
-    success "Chargeur automatique : placez toutes les pages dans le bac."
+    echo ""
+    echo -ne "  ${BOLD}→${RESET} Pages imprimées recto verso (scanner les deux faces) ? ${DIM}[o/N]${RESET} : "
+    read -r _dup
+    if [[ "${_dup,,}" == "o" ]]; then DUPLEX=true; else DUPLEX=false; fi
+    if $DUPLEX; then
+      success "Chargeur automatique, recto verso : placez toutes les pages dans le bac."
+    else
+      success "Chargeur automatique : placez toutes les pages dans le bac."
+    fi
   fi
 }
 
@@ -687,7 +714,7 @@ menu_summary() {
     if [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "mode continu (au fil de l'eau)"
     elif [[ "$MULTI_PAGE_MODE" == "adf" ]]; then
-      printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "chargeur automatique${SCAN_SOURCE:+ ($SCAN_SOURCE)}"
+      printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "chargeur automatique$($DUPLEX && echo ", recto verso")${SCAN_SOURCE:+ ($SCAN_SOURCE)}"
     else
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "$NB_PAGES"
     fi
@@ -729,6 +756,7 @@ menu_summary() {
 # =============================================================================
 
 run_interactive() {
+  INTERACTIVE=true
   banner
   check_and_install_deps
 
@@ -755,7 +783,7 @@ run_interactive() {
         menu_mode
         menu_multipage
         ;;
-    4)  list_devices ;;
+    4)  run_diagnostic ;;
     5)  menu_settings ;;
     6)  echo "Au revoir !"; exit 0 ;;
   esac
@@ -807,12 +835,14 @@ ${BOLD}OPTIONS${RESET}
   -p             Mode multi-pages (pause entre chaque page)
   -n <nb>        Nombre de pages en mode multi-pages (défaut: ${NB_PAGES})
   -a             Chargeur automatique (ADF) : scanne toutes les pages du bac
-  -S <source>    Source SANE explicite (ex: "ADF Duplex", "Flatbed") — voir -l
+  -2             Recto verso avec le chargeur (aussi --recto-verso, implique -a)
+  -S <source>    Source SANE explicite (ex: "ADF Duplex", "Flatbed") — voir -D
   -y             Écraser le fichier de sortie s'il existe déjà
   -V             Ouvrir le fichier produit à la fin (xdg-open)
   -k             Garder les fichiers temporaires
   -C             Désactiver la compression ghostscript
   -l             Lister les scanners disponibles
+  -D             Diagnostic : réglages acceptés par chaque scanner (aussi --diagnostic)
   -h             Afficher cette aide
 
 ${BOLD}CONFIGURATION${RESET}
@@ -831,8 +861,20 @@ EOF
 }
 
 list_devices() {
+  command -v scanimage &>/dev/null || error "scanimage introuvable — installe sane-utils"
   info "Recherche des scanners disponibles..."
-  scanimage -L 2>/dev/null || error "scanimage introuvable — installe sane-utils"
+  local lines=() l
+  mapfile -t lines < <(_list_scanners)
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    warn "Aucun scanner détecté."
+    _no_scanner_hint
+    exit 0
+  fi
+  for l in "${lines[@]}"; do
+    IFS=$'\t' read -r _dev _name _type <<< "$l"
+    printf "    ${BOLD}%s${RESET}  ${DIM}%s — %s${RESET}\n" "$_name" "$_dev" "$_type"
+  done
+  echo -e "\n    ${DIM}Choisir un scanner : -d <identifiant>   Détails : -D${RESET}"
   exit 0
 }
 
@@ -842,7 +884,20 @@ list_devices() {
 
 load_config
 
-while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMlh" opt; do
+# Options longues reconnues : --diagnostic, --help
+_args=()
+for _a in "$@"; do
+  case "$_a" in
+    --diagnostic) _args+=("-D") ;;
+    --recto-verso|--duplex) _args+=("-2") ;;
+    --help)       _args+=("-h") ;;
+    *)            _args+=("$_a") ;;
+  esac
+done
+set -- "${_args[@]}"
+unset _args _a
+
+while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMDlh2" opt; do
   case $opt in
     r) RESOLUTION="$OPTARG" ;;
     m) MODE="$OPTARG" ;;
@@ -858,6 +913,7 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMlh" opt; do
     n) NB_PAGES="$OPTARG" ;;
     p) MULTI_PAGE=true ;;
     a) MULTI_PAGE=true; MULTI_PAGE_MODE="adf" ;;
+    2) DUPLEX=true ;;
     S) SCAN_SOURCE="$OPTARG" ;;
     k) KEEP_TEMP=true ;;
     y) FORCE=true ;;
@@ -865,7 +921,8 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMlh" opt; do
     C) COMPRESS=false ;;
     R) OCR=true ;;
     M) STRIP_META=all ;;
-    l) list_devices ;;
+    D) DIAGNOSTIC=true ;;
+    l) LIST_ONLY=true ;;
     h) usage ;;
     *) usage ;;
   esac
@@ -933,6 +990,11 @@ validate_options() {
     info "-n ${NB_PAGES} sans -p : mode multi-pages activé."
     MULTI_PAGE=true
   fi
+  # Le recto verso passe par le chargeur : les deux faces sont des pages distinctes
+  if $DUPLEX && [[ -z "$INPUT_FILE" ]] && [[ "$MULTI_PAGE_MODE" != "adf" ]]; then
+    info "Recto verso : chargeur automatique activé."
+    MULTI_PAGE=true; MULTI_PAGE_MODE="adf"
+  fi
   if $OCR && [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
     warn "L'OCR ne s'applique qu'au PDF : ignoré pour une sortie JPEG."
     OCR=false
@@ -940,23 +1002,449 @@ validate_options() {
 }
 
 # =============================================================================
+#  SCANNERS ET CAPACITÉS (SANE)
+# =============================================================================
+#
+# SANE rend le script indépendant de la marque, mais chaque pilote nomme ses
+# réglages à sa façon (« Color », « 24bit Color », « True Gray »…) et n'accepte
+# que certaines résolutions et une zone maximale. On lit donc une fois les
+# options du scanner (scanimage -A) et on s'y adapte avant le premier scan.
+
+# Scanners détectés, un par ligne : « identifiant<TAB>marque modèle<TAB>type ».
+# Les webcams (pilote v4l, type « video camera ») sont écartées.
+_list_scanners() {
+  { scanimage -f $'%d\t%v %m\t%t\n' 2>/dev/null || true; } \
+    | awk -F'\t' 'NF >= 3 && $1 != "" && $1 !~ /^v4l:/ && tolower($3) !~ /camera/'
+}
+
+_airscan_installed() {
+  [[ -f /etc/sane.d/airscan.conf ]] || [[ -f /usr/local/etc/sane.d/airscan.conf ]]
+}
+
+# Conseils quand aucun scanner n'est trouvé
+_no_scanner_hint() {
+  echo -e "    ${DIM}→ Vérifiez que le scanner est allumé, branché en USB ou sur le même réseau.${RESET}"
+  if ! _airscan_installed; then
+    echo -e "    ${DIM}→ Beaucoup de scanners réseau ou récents marchent sans pilote avec sane-airscan :${RESET}"
+    echo -e "    ${DIM}  sudo apt install sane-airscan${RESET}"
+  fi
+  echo -e "    ${DIM}→ Sinon, installez le pilote SANE du fabricant, puis vérifiez avec : scanimage -L${RESET}"
+}
+
+# Mode interactif, aucun scanner trouvé : propose d'installer sane-airscan.
+# Retourne 0 s'il vient d'être installé (il faut alors relancer la recherche).
+_offer_airscan() {
+  $INTERACTIVE || return 1
+  _airscan_installed && return 1
+  command -v apt &>/dev/null || return 1
+  warn "Aucun scanner détecté."
+  echo -e "    ${DIM}sane-airscan permet d'utiliser sans pilote la plupart des scanners réseau ou récents.${RESET}"
+  echo -ne "  ${BOLD}→${RESET} Installer sane-airscan maintenant ? ${DIM}[o/N]${RESET} : "
+  read -r _ans
+  [[ "${_ans,,}" == "o" ]] || return 1
+  if sudo apt install -y sane-airscan; then
+    success "sane-airscan installé, nouvelle recherche..."
+    return 0
+  fi
+  warn "Échec de l'installation de sane-airscan."
+  return 1
+}
+
+# Menu de choix parmi les lignes de _list_scanners (+ saisie libre) → DEVICE
+_choose_scanner() {
+  local lines=("$@") i=0 l dev name type
+  for l in "${lines[@]}"; do
+    i=$(( i + 1 ))
+    IFS=$'\t' read -r dev name type <<< "$l"
+    print_opt "$i" "$name" "$dev"
+  done
+  print_opt "$(( i + 1 ))" "Autre" "Saisir l'identifiant SANE à la main"
+  ask_choice "Scanner" "1" "$(( i + 1 ))"
+  if (( REPLY <= i )); then
+    DEVICE="${lines[REPLY-1]%%$'\t'*}"
+  else
+    ask "Identifiant du scanner (ex: brother5:net1;dev0)" ""
+    DEVICE="$REPLY"
+  fi
+  if [[ -n "$DEVICE" ]]; then success "Scanner : ${DEVICE}"; fi
+}
+
+# Aucun scanner imposé (-d ou réglages) : prend le seul détecté ; s'il y en a
+# plusieurs, demande lequel (mode interactif) ou prend le premier (mode CLI).
+_pick_scanner() {
+  local lines=()
+  info "Recherche des scanners..."
+  mapfile -t lines < <(_list_scanners)
+  if [[ ${#lines[@]} -eq 0 ]] && _offer_airscan; then mapfile -t lines < <(_list_scanners); fi
+
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    echo -e "${RED}[ERR]${RESET}  Aucun scanner détecté." >&2
+    _no_scanner_hint >&2
+    exit 1
+  fi
+
+  local dev name type
+  if [[ ${#lines[@]} -eq 1 ]]; then
+    IFS=$'\t' read -r dev name type <<< "${lines[0]}"
+    DEVICE="$dev"
+    info "Scanner : ${name} (${dev})"
+  elif $INTERACTIVE; then
+    section "Plusieurs scanners détectés"
+    _choose_scanner "${lines[@]}"
+  else
+    IFS=$'\t' read -r dev name type <<< "${lines[0]}"
+    DEVICE="$dev"
+    warn "${#lines[@]} scanners détectés, utilisé : ${name} (${dev})"
+    local l
+    for l in "${lines[@]:1}"; do
+      IFS=$'\t' read -r dev name type <<< "$l"
+      echo -e "    ${DIM}autre : ${name}  →  -d \"${dev}\"${RESET}"
+    done
+  fi
+}
+
+# Lit les options du scanner (scanimage -A) pour DEVICE et SCAN_SOURCE, une
+# seule fois par couple scanner/source (la zone maximale dépend de la source).
+# CAPS_OK=false si elles sont illisibles : on garde alors les réglages standard.
+_load_caps() {
+  local key="${DEVICE}|${SCAN_SOURCE}"
+  [[ "$CAPS_KEY" == "$key" ]] && return 0
+  CAPS_KEY="$key"
+  local opts=()
+  if [[ -n "$DEVICE" ]]; then opts+=("--device-name=$DEVICE"); fi
+  if [[ -n "$SCAN_SOURCE" ]]; then opts+=("--source=$SCAN_SOURCE"); fi
+  if SCANNER_CAPS=$(scanimage "${opts[@]}" -A 2>/dev/null) && [[ -n "$SCANNER_CAPS" ]]; then
+    CAPS_OK=true
+  else
+    SCANNER_CAPS=""
+    CAPS_OK=false
+  fi
+}
+
+# Valeurs d'une option du scanner, sans la valeur par défaut ni le pas :
+#   « --mode Lineart|Gray|Color [Color] »                   → « Lineart|Gray|Color »
+#   « --resolution 50..1200dpi (in steps of 1) [300] »      → « 50..1200dpi »
+# Code retour 1 si le scanner n'a pas cette option.
+_cap_values() {
+  local opt="$1" line
+  line=$(grep -m1 -E -- "^[[:space:]]*${opt}[[:space:]]" <<< "$SCANNER_CAPS" || true)
+  [[ -n "$line" ]] || return 1
+  line="${line#*"${opt}" }"
+  line="${line% \[*}"
+  line="${line%% (in steps of*}"
+  printf '%s' "$line"
+}
+
+# Pas d'une option à plage (« (in steps of 50) »), vide sinon
+_cap_step() {
+  local line
+  line=$(grep -m1 -E -- "^[[:space:]]*$1[[:space:]]" <<< "$SCANNER_CAPS" || true)
+  if [[ "$line" =~ \(in\ steps\ of\ ([0-9.]+)\) ]]; then echo "${BASH_REMATCH[1]}"; fi
+}
+
+# Nom du mode SANE pour « color » ou « gray » dans le vocabulaire du pilote :
+#   Color, Colour, 24bit Color…  /  Gray, Grey, Grayscale, True Gray…
+# Préfère le nom exact, puis un nom sans variante « [Fast] ». Vide si aucun.
+# Code retour 1 si le scanner n'a pas d'option --mode.
+_pick_mode_name() {
+  local want="$1" list m low best=""
+  list=$(_cap_values "--mode") || return 1
+  local IFS='|' vals=()
+  read -ra vals <<< "$list"
+  for m in "${vals[@]}"; do
+    low="${m,,}"
+    if [[ "$want" == "color" ]]; then
+      [[ "$low" =~ colou?r ]] || continue
+      if [[ "$low" =~ ^colou?r$ ]]; then echo "$m"; return 0; fi
+    else
+      [[ "$low" =~ gr[ae]y ]] || continue
+      [[ "$low" =~ (diffusion|dither|halftone) ]] && continue
+      if [[ "$low" =~ ^gr[ae]y(scale)?$ ]]; then echo "$m"; return 0; fi
+    fi
+    if [[ -z "$best" ]] || { [[ "$best" == *\[* ]] && [[ "$m" != *\[* ]]; }; then best="$m"; fi
+  done
+  echo "$best"
+}
+
+# Résolution acceptée par le scanner la plus proche de $1 (liste de valeurs ou
+# plage avec pas). Affiche $1 inchangée si le scanner ne précise rien.
+_fit_resolution() {
+  local want="$1" spec step
+  spec=$(_cap_values "--resolution") || { echo "$want"; return 0; }
+  step=$(_cap_step "--resolution")
+  awk -v want="$want" -v spec="${spec//dpi/}" -v step="${step:-0}" 'BEGIN {
+    if (index(spec, "..")) {
+      split(spec, r, /\.\./); min = r[1] + 0; max = r[2] + 0
+      v = want
+      if (max > 0 && v > max) v = max
+      if (v < min) v = min
+      if (step > 1) v = min + int((v - min) / step + 0.5) * step
+      if (max > 0 && v > max) v -= step
+      printf "%d\n", v + 0.5; exit
+    }
+    n = split(spec, vals, "|"); best = ""
+    for (i = 1; i <= n; i++) {
+      if (vals[i] !~ /^[0-9]+([.][0-9]+)?$/) continue
+      d = vals[i] - want; if (d < 0) d = -d
+      if (best == "" || d < bd || (d == bd && vals[i] + 0 > best + 0)) { best = vals[i]; bd = d }
+    }
+    if (best == "") best = want
+    printf "%d\n", best + 0.5
+  }'
+}
+
+# Taille maximale en mm d'une option de zone (-x ou -y), vide si inconnue
+_cap_max_mm() {
+  local spec
+  spec=$(_cap_values "$1") || return 0
+  if [[ "$spec" =~ \.\.([0-9]+([.][0-9]+)?)mm ]]; then echo "${BASH_REMATCH[1]}"; fi
+}
+
+# Source de type chargeur (ADF / Feeder) parmi les sources du scanner :
+# recto simple de préférence, ou recto verso si $1 vaut « duplex ». Rien si aucune.
+_detect_adf_source() {
+  local want="${1:-simplex}" list
+  list=$(_cap_values "--source") || return 0
+  local IFS='|' src candidates=()
+  read -ra candidates <<< "$list"
+  for src in "${candidates[@]}"; do
+    [[ "${src,,}" =~ (adf|feeder) ]] || continue
+    if [[ "$want" == "duplex" ]]; then
+      [[ "${src,,}" =~ duplex ]] && { echo "$src"; return 0; }
+    else
+      [[ "${src,,}" =~ duplex ]] || { echo "$src"; return 0; }
+    fi
+  done
+  [[ "$want" == "duplex" ]] && return 0
+  for src in "${candidates[@]}"; do
+    if [[ "${src,,}" =~ (adf|feeder) ]]; then echo "$src"; return 0; fi
+  done
+}
+
+# Adapte le mode couleur, la résolution et la zone de scan aux options lues.
+_adapt_to_caps() {
+  local want=color fallback=Color
+  if [[ "$MODE" == "bw" ]]; then want=gray; fallback=Gray; fi
+
+  # --- Mode couleur ---
+  SCAN_MODE_NAME="$fallback"
+  if $CAPS_OK; then
+    local name="" other=color
+    [[ "$want" == "color" ]] && other=gray
+    if ! name=$(_pick_mode_name "$want"); then
+      SCAN_MODE_NAME=""   # pas d'option --mode : réglage propre au scanner
+    else
+      # Sans niveaux de gris, on scanne en couleur (le traitement convertit), et inversement
+      [[ -n "$name" ]] || name=$(_pick_mode_name "$other")
+      if [[ -n "$name" ]]; then
+        SCAN_MODE_NAME="$name"
+      else
+        SCAN_MODE_NAME=""
+        warn "Aucun mode couleur ou gris reconnu ($(_cap_values "--mode")) : mode par défaut du scanner."
+      fi
+    fi
+  fi
+
+  # --- Résolution ---
+  SCAN_RES_OPT=true
+  if $CAPS_OK; then
+    if _cap_values "--resolution" >/dev/null; then
+      local fit; fit=$(_fit_resolution "$RESOLUTION")
+      if [[ "$fit" =~ ^[0-9]+$ ]] && (( fit != RESOLUTION )); then
+        warn "Résolution ${RESOLUTION} dpi non acceptée par le scanner : ${fit} dpi utilisée."
+        RESOLUTION="$fit"
+      fi
+    else
+      SCAN_RES_OPT=false
+      warn "Le scanner ne propose pas de réglage de résolution : résolution par défaut du scanner."
+    fi
+  fi
+
+  # --- Zone de scan ---
+  SCAN_SIZE_OPTS=()
+  local dims w h
+  dims=$(_paper_dims)
+  [[ -n "$dims" ]] || return 0
+  read -r w h <<< "$dims"
+  if $CAPS_OK; then
+    if ! _cap_values "-x" >/dev/null || ! _cap_values "-y" >/dev/null; then
+      warn "Le scanner ne permet pas de choisir la zone : scan en plein format."
+      return 0
+    fi
+    local max_x max_y
+    max_x=$(_cap_max_mm "-x"); max_y=$(_cap_max_mm "-y")
+    if [[ -n "$max_x" ]] && awk -v a="$w" -v b="$max_x" 'BEGIN { exit !(a > b) }'; then
+      warn "Largeur ${w} mm plus grande que la zone du scanner : limitée à ${max_x} mm."
+      w="$max_x"
+    fi
+    if [[ -n "$max_y" ]] && awk -v a="$h" -v b="$max_y" 'BEGIN { exit !(a > b) }'; then
+      warn "Hauteur ${h} mm plus grande que la zone du scanner : limitée à ${max_y} mm."
+      h="$max_y"
+    fi
+  fi
+  SCAN_SIZE_OPTS=("-x" "$w" "-y" "$h")
+}
+
+# Message d'erreur de scanimage sans les lignes de progression ni les
+# avertissements sans conséquence (« rounded value of br-y… »)
+_scan_error_text() {
+  grep -v -e '^Scanning' -e '^Scanned' -e 'rounded value of' "$1" || true
+}
+
+# Conseil adapté à l'erreur de scanimage ($1), sinon le conseil par défaut ($2)
+_scan_error_hint() {
+  local low="${1,,}"
+  if [[ "$low" =~ (out\ of\ documents|no\ more\ documents|no\ documents|feeder) ]]; then
+    echo "Le bac du chargeur est vide : placez la feuille dans le bac, puis relancez."
+  elif [[ "$low" =~ (jammed|jam) ]]; then
+    echo "Bourrage papier : dégagez la feuille, puis relancez."
+  elif [[ "$low" =~ (busy|in\ use) ]]; then
+    echo "Le scanner est occupé (autre logiciel ouvert ?) : fermez-le, puis relancez."
+  elif [[ "$low" =~ (invalid\ argument) ]]; then
+    echo "Le scanner refuse un réglage : voir ce qu'il accepte avec -D."
+  else
+    echo "$2"
+  fi
+}
+
+# Avant le premier scan : choix du scanner, source du chargeur, puis adaptation
+# des réglages à ce que le scanner accepte.
+prepare_scanner() {
+  if [[ -z "$DEVICE" ]]; then _pick_scanner; fi
+
+  if $MULTI_PAGE && [[ "$MULTI_PAGE_MODE" == "adf" ]] && [[ -z "$SCAN_SOURCE" ]]; then
+    _load_caps
+    if $DUPLEX; then SCAN_SOURCE=$(_detect_adf_source duplex); fi
+    if [[ -n "$SCAN_SOURCE" ]]; then
+      info "Recto verso : source « ${SCAN_SOURCE} »."
+    else
+      if $DUPLEX && $CAPS_OK; then
+        warn "Ce scanner ne propose pas de source recto verso : seul le recto sera scanné."
+      fi
+      SCAN_SOURCE=$(_detect_adf_source)
+      if [[ -n "$SCAN_SOURCE" ]]; then
+        info "Source chargeur détectée : ${SCAN_SOURCE}"
+      else
+        warn "Aucune source « ADF » détectée : le scanner utilisera sa source par défaut."
+        echo -e "    ${DIM}Pour la forcer : -S \"<source>\" (voir -D).${RESET}"
+      fi
+    fi
+  fi
+
+  # Scanner sans vitre (à défilement) et aucune source imposée : pour une page à
+  # la fois, le chargeur en recto simple plutôt que la source par défaut du
+  # pilote (souvent le recto verso)
+  if [[ -z "$SCAN_SOURCE" ]]; then
+    _load_caps
+    local sources
+    if sources=$(_cap_values "--source") && [[ ! "${sources,,}" =~ (flatbed|platen|glass) ]]; then
+      SCAN_SOURCE=$(_detect_adf_source)
+      if [[ -n "$SCAN_SOURCE" ]]; then
+        info "Scanner sans vitre : source « ${SCAN_SOURCE} » (placez la feuille dans le bac)."
+      fi
+    fi
+  fi
+
+  _load_caps
+  if ! $CAPS_OK; then
+    warn "Options du scanner illisibles : réglages standard utilisés (Color/Gray, ${RESOLUTION} dpi)."
+  fi
+  _adapt_to_caps
+}
+
+# Ligne « libellé  valeur » alignée (compte les caractères, pas les octets)
+_diag_row() {
+  printf "    %s%*s %b\n" "$1" $(( 22 - ${#1} > 0 ? 22 - ${#1} : 0 )) "" "$2"
+}
+
+# Diagnostic (-D / --diagnostic / menu) : scanners détectés et, pour chacun,
+# ce qu'il accepte et ce que scandoc utilisera.
+run_diagnostic() {
+  command -v scanimage &>/dev/null || error "scanimage introuvable — installe sane-utils"
+  section "Diagnostic des scanners"
+  info "$(scanimage --version 2>/dev/null | head -1)"
+  if _airscan_installed; then info "sane-airscan : installé"; else info "sane-airscan : non installé"; fi
+
+  local lines=() l
+  info "Recherche des scanners..."
+  mapfile -t lines < <(_list_scanners)
+  if [[ -n "$DEVICE" ]]; then
+    # Scanner imposé (-d ou réglages) : lui seul, même s'il n'est pas listé
+    local found=""
+    for l in "${lines[@]}"; do [[ "${l%%$'\t'*}" == "$DEVICE" ]] && found="$l"; done
+    lines=("${found:-${DEVICE}$'\t'${DEVICE}$'\t'non listé par SANE}")
+  fi
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    warn "Aucun scanner détecté."
+    _no_scanner_hint
+    exit 0
+  fi
+
+  local dev name type src_given="$SCAN_SOURCE"
+  for l in "${lines[@]}"; do
+    IFS=$'\t' read -r dev name type <<< "$l"
+    echo ""
+    echo -e "  ${BOLD}${name}${RESET}  ${DIM}${dev} — ${type}${RESET}"
+    DEVICE="$dev"; SCAN_SOURCE="$src_given"; CAPS_KEY=""
+    _load_caps
+    if ! $CAPS_OK; then
+      warn "Options illisibles (scanner occupé, éteint ou injoignable ?)."
+      continue
+    fi
+
+    local v
+    v=$(_cap_values "--source") || v="—"
+    _diag_row "Sources :" "${v//|/, }"
+    v=$(_detect_adf_source); _diag_row "Chargeur (-a) :" "${v:-aucun détecté}"
+    v=$(_detect_adf_source duplex); _diag_row "Recto verso (-2) :" "${v:-non proposé}"
+    if v=$(_cap_values "--mode"); then
+      _diag_row "Modes :" "${v//|/, }"
+      local c g
+      c=$(_pick_mode_name color); g=$(_pick_mode_name gray)
+      _diag_row "→ couleur :" "${c:-${YELLOW}non reconnu${RESET}}"
+      _diag_row "→ noir et blanc (bw) :" "${g:-${c:-${YELLOW}non reconnu${RESET}}}"
+    else
+      _diag_row "Modes :" "pas d'option --mode"
+    fi
+    if v=$(_cap_values "--resolution"); then
+      _diag_row "Résolutions :" "${v//|/, }"
+      _diag_row "→ 150 / 300 / 600 :" "$(_fit_resolution 150) / $(_fit_resolution 300) / $(_fit_resolution 600) dpi"
+    else
+      _diag_row "Résolutions :" "pas d'option --resolution"
+    fi
+    local mx my
+    mx=$(_cap_max_mm "-x"); my=$(_cap_max_mm "-y")
+    if [[ -n "$mx" && -n "$my" ]]; then
+      local fits=() f d fw fh
+      for f in A5 A4 Letter Legal; do
+        PAPER_FORMAT="$f"; d=$(_paper_dims); read -r fw fh <<< "$d"
+        if awk -v w="$fw" -v h="$fh" -v X="$mx" -v Y="$my" 'BEGIN { exit !(w <= X && h <= Y) }'; then fits+=("$f"); fi
+      done
+      _diag_row "Zone maximale :" "${mx} × ${my} mm  (formats complets : ${fits[*]:-aucun})"
+    else
+      _diag_row "Zone maximale :" "inconnue"
+    fi
+  done
+  echo ""
+  echo -e "    ${DIM}Choisir un scanner : -d <identifiant>   Choisir une source : -S \"<source>\"${RESET}"
+  exit 0
+}
+
+# =============================================================================
 #  SCAN
 # =============================================================================
 
-# Retourne les options -x / -y pour scanimage selon PAPER_FORMAT
-# En mode "auto" : pas de contrainte, le scanner utilise sa plage maximale
-_paper_size_opts() {
+# Largeur et hauteur en mm (« 210 297 ») de la zone à scanner selon PAPER_FORMAT.
+# En mode "auto" : rien, le scanner utilise sa zone maximale.
+_paper_dims() {
   case "$PAPER_FORMAT" in
-    auto)   echo "" ;;
-    A4)     echo "-x 210 -y 297" ;;
-    A5)     echo "-x 148 -y 210" ;;
-    Letter) echo "-x 215.9 -y 279.4" ;;
-    Legal)  echo "-x 215.9 -y 355.6" ;;
+    A4)     echo "210 297" ;;
+    A5)     echo "148 210" ;;
+    Letter) echo "215.9 279.4" ;;
+    Legal)  echo "215.9 355.6" ;;
     custom:*)
       local dims="${PAPER_FORMAT#custom:}"
-      local w="${dims%x*}"
-      local h="${dims#*x}"
-      echo "-x $w -y $h"
+      echo "${dims%x*} ${dims#*x}"
       ;;
     *) echo "" ;;
   esac
@@ -985,19 +1473,15 @@ normalize_paper_format() {
 }
 
 # Options scanimage communes au scan simple et au chargeur : scanner, source,
-# mode couleur, zone de scan, format et résolution — résultat dans SCAN_OPTS
+# mode couleur, zone de scan, format et résolution — résultat dans SCAN_OPTS.
+# Le mode, la résolution et la zone ont été adaptés au scanner par prepare_scanner.
 _scan_opts() {
   SCAN_OPTS=()
   if [[ -n "$DEVICE" ]]; then SCAN_OPTS+=("--device-name=$DEVICE"); fi
   if [[ -n "$SCAN_SOURCE" ]]; then SCAN_OPTS+=("--source=$SCAN_SOURCE"); fi
-  case "$MODE" in
-    bw) SCAN_OPTS+=("--mode=Gray") ;;
-    *)  SCAN_OPTS+=("--mode=Color") ;;
-  esac
-  local size_opts
-  size_opts=$(_paper_size_opts)
-  # shellcheck disable=SC2206
-  SCAN_OPTS+=($size_opts "--format=pnm" "--resolution=$RESOLUTION")
+  if [[ -n "$SCAN_MODE_NAME" ]]; then SCAN_OPTS+=("--mode=$SCAN_MODE_NAME"); fi
+  SCAN_OPTS+=("${SCAN_SIZE_OPTS[@]}" "--format=pnm")
+  if $SCAN_RES_OPT; then SCAN_OPTS+=("--resolution=$RESOLUTION"); fi
 }
 
 # En mode auto : recadrage automatique des bandes noires/vides en bordure
@@ -1024,9 +1508,9 @@ do_scan() {
   scan_err=$(mktemp)
   if ! scanimage "${SCAN_OPTS[@]}" > "$outfile" 2>"$scan_err"; then
     local msg
-    msg=$(cat "$scan_err")
+    msg=$(_scan_error_text "$scan_err")
     rm -f "$scan_err"
-    error "Échec du scan : ${msg:-erreur inconnue}\n  → Vérifiez que le document est chargé et le scanner prêt."
+    error "Échec du scan : ${msg:-erreur inconnue}\n  → $(_scan_error_hint "$msg" "Vérifiez que le document est chargé et le scanner prêt.")"
   fi
   rm -f "$scan_err"
 
@@ -1038,41 +1522,10 @@ do_scan() {
   success "Scan terminé → $outfile"
 }
 
-# Cherche dans les options du scanner une source de type chargeur (ADF / Feeder).
-# Privilégie le recto simple ; affiche la source trouvée, rien sinon.
-_detect_adf_source() {
-  local dev_opts=()
-  if [[ -n "$DEVICE" ]]; then dev_opts+=("--device-name=$DEVICE"); fi
-  local line
-  line=$(scanimage "${dev_opts[@]}" -A 2>/dev/null | grep -m1 -E '^[[:space:]]*--source' || true)
-  [[ -n "$line" ]] || return 0
-  # Ex : "    --source Flatbed|ADF|ADF Duplex [Flatbed]"
-  line="${line#*--source }"
-  line="${line%% \[*}"
-  local IFS='|' src candidates=()
-  read -ra candidates <<< "$line"
-  for src in "${candidates[@]}"; do
-    if [[ "${src,,}" =~ (adf|feeder) ]] && [[ ! "${src,,}" =~ duplex ]]; then echo "$src"; return 0; fi
-  done
-  for src in "${candidates[@]}"; do
-    if [[ "${src,,}" =~ (adf|feeder) ]]; then echo "$src"; return 0; fi
-  done
-}
-
 # Scan de tout le bac du chargeur en une seule commande (scanimage --batch).
 # Remplit PAGES avec les pages traitées.
 do_scan_adf() {
   local tmpdir="$1"
-
-  if [[ -z "$SCAN_SOURCE" ]]; then
-    SCAN_SOURCE=$(_detect_adf_source)
-    if [[ -n "$SCAN_SOURCE" ]]; then
-      info "Source chargeur détectée : ${SCAN_SOURCE}"
-    else
-      warn "Aucune source « ADF » détectée : le scanner utilisera sa source par défaut."
-      echo -e "    ${DIM}Pour la forcer : -S \"<source>\" (voir « scanimage -A »).${RESET}"
-    fi
-  fi
   _scan_opts
 
   info "Scan du chargeur en cours (${RESOLUTION} dpi, format ${PAPER_FORMAT}, mode ${MODE})..."
@@ -1091,7 +1544,7 @@ do_scan_adf() {
   for f in "${raw[@]}"; do [[ -s "$f" ]] && pages_ok+=("$f"); done
 
   if [[ ${#pages_ok[@]} -eq 0 ]]; then
-    local msg; msg=$(grep -v '^Scanning\|^Scanned' "$scan_err" || true)
+    local msg; msg=$(_scan_error_text "$scan_err")
     rm -f "$scan_err"
     error "Aucune page scannée depuis le chargeur : ${msg:-erreur inconnue}\n  → Vérifiez que les pages sont dans le bac et que le scanner a un chargeur (-S pour choisir la source)."
   fi
@@ -1595,6 +2048,7 @@ main_process() {
   if ! $KEEP_TEMP; then trap 'rm -rf "$SCAN_TMPDIR"' EXIT; fi
 
   PAGES=()
+  if [[ -z "$INPUT_FILE" ]]; then prepare_scanner; fi
 
   # --- Étapes 1 et 2 : source (scan ou fichier existant) + post-traitement ---
   if [[ -n "$INPUT_FILE" ]]; then
@@ -1731,6 +2185,10 @@ _print_done() {
 if [[ $# -eq 0 ]]; then
   # Aucun argument → mode interactif avec menus guidés
   run_interactive
+elif $LIST_ONLY; then
+  list_devices
+elif $DIAGNOSTIC; then
+  run_diagnostic
 else
   # Arguments CLI → mode direct (comportement d'origine)
   validate_options

@@ -81,8 +81,8 @@ sudo ln -s "$PWD/scandoc.sh" /usr/local/bin/scandoc
 
 Le script guide étape par étape :
 
-1. Choix de l'action (scan simple / fichier existant / multi-pages / lister les scanners)
-2. Sélection du scanner (auto-détection ou saisie manuelle)
+1. Choix de l'action (scan simple / fichier existant / multi-pages / diagnostic des scanners)
+2. Sélection du scanner (auto-détection, choix dans la liste ou saisie manuelle)
 3. Format papier
 4. Résolution
 5. Mode de traitement
@@ -114,6 +114,7 @@ Le script guide étape par étape :
 | `-p` | Mode multi-pages | — |
 | `-n <nb>` | Nombre de pages (active le mode multi-pages si > 1) | `1` |
 | `-a` | Chargeur automatique (ADF) : scanne tout le bac d'un coup | — |
+| `-2`, `--recto-verso` | Recto verso avec le chargeur : les deux faces de chaque feuille deviennent des pages (implique `-a`) | — |
 | `-S <source>` | Source SANE explicite (`ADF`, `ADF Duplex`, `Flatbed`…, voir `scanimage -A`) | auto-détectée avec `-a` |
 | `-R` | Activer l'OCR | — |
 | `-L <lang>` | Langue OCR (`fra`, `eng`, `fra+eng`…) | `fra+eng` |
@@ -126,6 +127,7 @@ Le script guide étape par étape :
 | `-V` | Ouvrir le fichier produit à la fin (`xdg-open`) | — |
 | `-k` | Garder les fichiers temporaires (debug) | — |
 | `-l` | Lister les scanners disponibles | — |
+| `-D`, `--diagnostic` | Afficher ce que chaque scanner accepte (sources, modes, résolutions, zone) | — |
 | `-h` | Afficher l'aide | — |
 
 ---
@@ -172,6 +174,7 @@ En mode interactif, les chemins acceptent `~` et le glisser-déposer depuis le g
 
 # Toutes les pages du chargeur automatique, en noir et blanc
 ./scandoc.sh -a -m bw -o courrier.pdf
+./scandoc.sh --recto-verso -o recto_verso.pdf
 
 # PDF avec OCR en français + suppression des métadonnées
 ./scandoc.sh -R -L fra -M -o document_ocr.pdf
@@ -230,16 +233,29 @@ Les PDF et JPEG produits contiennent par défaut des métadonnées révélant le
 
 ## Compatibilité scanner
 
-Le script utilise SANE (`scanimage`) et est compatible avec tous les scanners supportés par SANE sous Linux : Brother, Epson, Canon, HP, Fujitsu, Plustek, etc.
+Le script passe par SANE (`scanimage`) : il marche avec tous les scanners pris en charge par SANE sous Linux (Brother, Epson, Canon, HP, Fujitsu, Plustek…), y compris la plupart des scanners réseau ou récents sans pilote grâce à [`sane-airscan`](https://github.com/alexpevzner/sane-airscan) (`sudo apt install sane-airscan`).
 
-Pour trouver l'identifiant de votre scanner :
+Chaque pilote nomme ses réglages à sa façon. Avant de scanner, le script lit une fois les options du scanner (`scanimage -A`) et s'adapte :
+
+- **Mode couleur** : le nom attendu par le pilote est choisi automatiquement (`Color`, `Colour`, `24bit Color`… / `Gray`, `Grayscale`, `True Gray`…).
+- **Résolution** : arrondie à la valeur acceptée la plus proche (ex. 250 dpi → 300 dpi si le scanner ne propose que 200 et 300).
+- **Format papier** : limité à la zone maximale du scanner (ex. Legal sur une vitre A4).
+- **Chargeur (`-a`)** : la source « ADF » / « Feeder » est trouvée parmi celles du scanner.
+- **Recto verso (`-2`)** : la source recto verso du chargeur (`Duplex ADF`, `ADF Duplex`…) est choisie automatiquement ; en mode interactif, la question est posée dans le menu du chargeur. Sans source recto verso, seul le recto est scanné (avec un avertissement).
+- **Scanner sans vitre (à défilement)** : un scan simple utilise le chargeur en recto seul.
+- **Plusieurs scanners** : en mode interactif, le script demande lequel utiliser ; en ligne de commande, il prend le premier et indique comment choisir les autres avec `-d`. Les webcams sont ignorées.
+
+Chaque ajustement est signalé par un avertissement. Si les options du scanner ne peuvent pas être lues, les réglages standard (`Color`/`Gray`) sont utilisés.
+
+Pour voir les scanners détectés et ce que chacun accepte :
 ```bash
-./scandoc.sh -l
-# ou
-scanimage -L
+./scandoc.sh -l            # liste rapide
+./scandoc.sh --diagnostic  # détail : sources, modes, résolutions, zone maximale
 ```
 
-Les backends testés : `dsseries` (Brother DS-720D). Les options utilisées (`--mode`, `--resolution`, `-x`, `-y`, `--format=pnm`) sont standard et supportées par la quasi-totalité des backends modernes.
+Les pilotes propriétaires de certains fabricants (Brother `brscan`, Epson Image Scan…) sont à installer séparément, depuis le site du fabricant.
+
+Backends testés : `dsseries` (Brother DS-720D).
 
 ---
 
