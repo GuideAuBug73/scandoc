@@ -41,7 +41,7 @@ sudo apt install sane-utils imagemagick ghostscript
 
 ```bash
 sudo apt install ocrmypdf tesseract-ocr-fra   # OCR français
-sudo apt install libimage-exiftool-perl        # Suppression complète des métadonnées
+sudo apt install libimage-exiftool-perl qpdf   # Suppression complète et définitive des métadonnées
 ```
 
 | Paquet | Rôle |
@@ -49,6 +49,7 @@ sudo apt install libimage-exiftool-perl        # Suppression complète des méta
 | `ocrmypdf` | Ajoute une couche de texte invisible dans le PDF |
 | `tesseract-ocr-fra` | Données de langue française pour Tesseract (OCR) |
 | `libimage-exiftool-perl` | Supprime les résidus de métadonnées laissés par Ghostscript |
+| `qpdf` | Réécrit le PDF pour que les métadonnées supprimées ne soient plus récupérables |
 
 > En mode interactif, le script propose d'installer automatiquement les paquets manquants.
 
@@ -121,9 +122,36 @@ Le script guide étape par étape :
 | `-w <0-100>` | Seuil de blanchiment (mode `clean`) | `75` |
 | `-b <0-3>` | Flou anti-bruit avant binarisation | `0` |
 | `-C` | Désactiver la compression Ghostscript | — |
+| `-y` | Écraser le fichier de sortie s'il existe déjà (sinon : question, ou erreur hors terminal) | — |
+| `-V` | Ouvrir le fichier produit à la fin (`xdg-open`) | — |
 | `-k` | Garder les fichiers temporaires (debug) | — |
 | `-l` | Lister les scanners disponibles | — |
 | `-h` | Afficher l'aide | — |
+
+---
+
+## Réglages par défaut
+
+Le menu **« Réglages par défaut »** (choix 5 du menu principal) enregistre vos choix habituels dans `~/.config/scandoc.conf` (ou `$XDG_CONFIG_HOME/scandoc.conf`, ou le chemin de la variable `SCANDOC_CONFIG`). Ils sont ensuite proposés par défaut dans les menus et utilisés en ligne de commande ; les options de la ligne de commande restent prioritaires.
+
+Le fichier peut aussi s'écrire à la main, une clé par ligne (il n'est jamais exécuté) :
+
+```ini
+DEVICE="brother5:net1;dev0"
+RESOLUTION="300"
+MODE="clean"            # scan | clean | bw | color
+PAPER_FORMAT="A4"       # auto | A4 | A5 | Letter | Legal | 210x297
+OUTPUT_FORMAT="pdf"     # pdf | jpeg
+OUTPUT_DIR="~/Documents/Scans"   # où ranger un fichier nommé sans dossier
+OCR="true"
+OCR_LANG="fra"
+STRIP_META="all"        # all | nodates | false
+OPEN_RESULT="true"      # ouvrir le fichier à la fin
+```
+
+Autres clés possibles : `SCAN_SOURCE`, `JPEG_QUALITY`, `THRESHOLD`, `WHITE_THRESH`, `BLUR`, `COMPRESS`.
+
+En mode interactif, les chemins acceptent `~` et le glisser-déposer depuis le gestionnaire de fichiers (guillemets, `file://`).
 
 ---
 
@@ -196,7 +224,7 @@ Les PDF et JPEG produits contiennent par défaut des métadonnées révélant le
 | **Supprimer sauf les dates** | Vide les champs outil/auteur, conserve CreationDate et ModDate |
 | **Supprimer tout** | Aucune métadonnée |
 
-> **Note PDF** : Ghostscript réinjecte toujours son champ `Producer`. Installez `libimage-exiftool-perl` pour une suppression complète.
+> **Note PDF** : Ghostscript réinjecte toujours son champ `Producer`, et exiftool modifie les PDF de façon réversible (les anciennes valeurs restent dans le fichier). Installez `libimage-exiftool-perl` et `qpdf` : exiftool vide les champs, puis qpdf réécrit le fichier pour que rien ne soit récupérable.
 
 ---
 

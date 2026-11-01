@@ -41,7 +41,7 @@ sudo apt install sane-utils imagemagick ghostscript
 
 ```bash
 sudo apt install ocrmypdf tesseract-ocr-fra   # French OCR
-sudo apt install libimage-exiftool-perl        # Full metadata removal
+sudo apt install libimage-exiftool-perl qpdf   # Complete, unrecoverable metadata removal
 ```
 
 | Package | Role |
@@ -49,6 +49,7 @@ sudo apt install libimage-exiftool-perl        # Full metadata removal
 | `ocrmypdf` | Adds an invisible text layer to the PDF |
 | `tesseract-ocr-fra` | French language data for Tesseract OCR |
 | `libimage-exiftool-perl` | Removes metadata residues left by Ghostscript |
+| `qpdf` | Rewrites the PDF so removed metadata can no longer be recovered |
 
 > In interactive mode, the script offers to automatically install any missing packages.
 
@@ -121,9 +122,21 @@ The script guides you step by step:
 | `-w <0-100>` | Whitening threshold (mode `clean`) | `75` |
 | `-b <0-3>` | Noise-reduction blur radius before binarisation | `0` |
 | `-C` | Disable Ghostscript compression | — |
+| `-y` | Overwrite the output file if it already exists (otherwise: prompt, or error outside a terminal) | — |
+| `-V` | Open the resulting file at the end (`xdg-open`) | — |
 | `-k` | Keep temporary files (debug) | — |
 | `-l` | List available scanners | — |
 | `-h` | Show help | — |
+
+---
+
+## Default settings
+
+The **"Réglages par défaut"** menu (choice 5 of the main menu) saves your usual choices to `~/.config/scandoc.conf` (or `$XDG_CONFIG_HOME/scandoc.conf`, or the path in `SCANDOC_CONFIG`). They become the menu defaults and are used on the command line; command-line options still take precedence.
+
+The file can also be written by hand, one `KEY="value"` per line (it is never executed). Keys: `DEVICE`, `SCAN_SOURCE`, `RESOLUTION`, `MODE`, `PAPER_FORMAT`, `OUTPUT_FORMAT`, `OUTPUT_DIR`, `JPEG_QUALITY`, `THRESHOLD`, `WHITE_THRESH`, `BLUR`, `COMPRESS`, `OCR`, `OCR_LANG`, `STRIP_META`, `OPEN_RESULT`.
+
+In interactive mode, paths accept `~` and drag-and-drop from a file manager (quotes, `file://`).
 
 ---
 
@@ -196,7 +209,7 @@ PDF and JPEG files produced by the script contain metadata by default, revealing
 | **Strip except dates** | Clears tool/author fields, keeps CreationDate and ModDate |
 | **Strip all** | No metadata |
 
-> **PDF note**: Ghostscript always re-injects its own `Producer` field. Install `libimage-exiftool-perl` for complete removal.
+> **PDF note**: Ghostscript always re-injects its own `Producer` field, and exiftool edits PDFs reversibly (old values stay in the file). Install `libimage-exiftool-perl` and `qpdf`: exiftool clears the fields, then qpdf rewrites the file so nothing is recoverable.
 
 ---
 
