@@ -50,6 +50,7 @@ MULTI_PAGE=false        # Scan multi-pages avec pause entre chaque page
 NB_PAGES=1              # Nombre de pages (mode multi-pages)
 MULTI_PAGE_MODE="fixed" # Mode multi-pages : fixed (nombre connu) | auto (continu jusqu'à stop) | adf (chargeur)
 SCAN_SOURCE=""          # Source SANE (ex : "ADF", "Flatbed") — auto-détectée en mode adf si vide
+DUPLEX=false            # Recto verso avec le chargeur (-2 / --recto-verso)
 KEEP_TEMP=false         # Garder les fichiers temporaires (debug)
 COMPRESS=true           # Compresser le PDF final avec ghostscript
 DEPTH=8                 # Profondeur de couleur (8=standard, 16=haute fidélité)
@@ -510,7 +511,15 @@ menu_multipage() {
     success "Mode continu : vous serez invité après chaque page."
   else
     MULTI_PAGE_MODE="adf"
-    success "Chargeur automatique : placez toutes les pages dans le bac."
+    echo ""
+    echo -ne "  ${BOLD}→${RESET} Pages imprimées recto verso (scanner les deux faces) ? ${DIM}[o/N]${RESET} : "
+    read -r _dup
+    if [[ "${_dup,,}" == "o" ]]; then DUPLEX=true; else DUPLEX=false; fi
+    if $DUPLEX; then
+      success "Chargeur automatique, recto verso : placez toutes les pages dans le bac."
+    else
+      success "Chargeur automatique : placez toutes les pages dans le bac."
+    fi
   fi
 }
 
@@ -705,7 +714,7 @@ menu_summary() {
     if [[ "$MULTI_PAGE_MODE" == "auto" ]]; then
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "mode continu (au fil de l'eau)"
     elif [[ "$MULTI_PAGE_MODE" == "adf" ]]; then
-      printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "chargeur automatique${SCAN_SOURCE:+ ($SCAN_SOURCE)}"
+      printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "chargeur automatique$($DUPLEX && echo ", recto verso")${SCAN_SOURCE:+ ($SCAN_SOURCE)}"
     else
       printf "    %-22s ${CYAN}%s${RESET}\n" "Pages :" "$NB_PAGES"
     fi
@@ -826,6 +835,7 @@ ${BOLD}OPTIONS${RESET}
   -p             Mode multi-pages (pause entre chaque page)
   -n <nb>        Nombre de pages en mode multi-pages (défaut: ${NB_PAGES})
   -a             Chargeur automatique (ADF) : scanne toutes les pages du bac
+  -2             Recto verso avec le chargeur (aussi --recto-verso, implique -a)
   -S <source>    Source SANE explicite (ex: "ADF Duplex", "Flatbed") — voir -D
   -y             Écraser le fichier de sortie s'il existe déjà
   -V             Ouvrir le fichier produit à la fin (xdg-open)
@@ -879,6 +889,7 @@ _args=()
 for _a in "$@"; do
   case "$_a" in
     --diagnostic) _args+=("-D") ;;
+    --recto-verso|--duplex) _args+=("-2") ;;
     --help)       _args+=("-h") ;;
     *)            _args+=("$_a") ;;
   esac
@@ -886,7 +897,7 @@ done
 set -- "${_args[@]}"
 unset _args _a
 
-while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMDlh" opt; do
+while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMDlh2" opt; do
   case $opt in
     r) RESOLUTION="$OPTARG" ;;
     m) MODE="$OPTARG" ;;
@@ -902,6 +913,7 @@ while getopts "r:m:o:f:t:w:b:d:F:O:L:n:S:apkyVCRMDlh" opt; do
     n) NB_PAGES="$OPTARG" ;;
     p) MULTI_PAGE=true ;;
     a) MULTI_PAGE=true; MULTI_PAGE_MODE="adf" ;;
+    2) DUPLEX=true ;;
     S) SCAN_SOURCE="$OPTARG" ;;
     k) KEEP_TEMP=true ;;
     y) FORCE=true ;;
@@ -977,6 +989,11 @@ validate_options() {
   if [[ -z "$INPUT_FILE" ]] && ! $MULTI_PAGE && (( NB_PAGES > 1 )); then
     info "-n ${NB_PAGES} sans -p : mode multi-pages activé."
     MULTI_PAGE=true
+  fi
+  # Le recto verso passe par le chargeur : les deux faces sont des pages distinctes
+  if $DUPLEX && [[ -z "$INPUT_FILE" ]] && [[ "$MULTI_PAGE_MODE" != "adf" ]]; then
+    info "Recto verso : chargeur automatique activé."
+    MULTI_PAGE=true; MULTI_PAGE_MODE="adf"
   fi
   if $OCR && [[ "$OUTPUT_FORMAT" == "jpeg" ]]; then
     warn "L'OCR ne s'applique qu'au PDF : ignoré pour une sortie JPEG."
@@ -1183,16 +1200,22 @@ _cap_max_mm() {
   if [[ "$spec" =~ \.\.([0-9]+([.][0-9]+)?)mm ]]; then echo "${BASH_REMATCH[1]}"; fi
 }
 
-# Source de type chargeur (ADF / Feeder) parmi les sources du scanner,
-# recto simple de préférence. Rien si aucune.
+# Source de type chargeur (ADF / Feeder) parmi les sources du scanner :
+# recto simple de préférence, ou recto verso si $1 vaut « duplex ». Rien si aucune.
 _detect_adf_source() {
-  local list
+  local want="${1:-simplex}" list
   list=$(_cap_values "--source") || return 0
   local IFS='|' src candidates=()
   read -ra candidates <<< "$list"
   for src in "${candidates[@]}"; do
-    if [[ "${src,,}" =~ (adf|feeder) ]] && [[ ! "${src,,}" =~ duplex ]]; then echo "$src"; return 0; fi
+    [[ "${src,,}" =~ (adf|feeder) ]] || continue
+    if [[ "$want" == "duplex" ]]; then
+      [[ "${src,,}" =~ duplex ]] && { echo "$src"; return 0; }
+    else
+      [[ "${src,,}" =~ duplex ]] || { echo "$src"; return 0; }
+    fi
   done
+  [[ "$want" == "duplex" ]] && return 0
   for src in "${candidates[@]}"; do
     if [[ "${src,,}" =~ (adf|feeder) ]]; then echo "$src"; return 0; fi
   done
@@ -1291,12 +1314,20 @@ prepare_scanner() {
 
   if $MULTI_PAGE && [[ "$MULTI_PAGE_MODE" == "adf" ]] && [[ -z "$SCAN_SOURCE" ]]; then
     _load_caps
-    SCAN_SOURCE=$(_detect_adf_source)
+    if $DUPLEX; then SCAN_SOURCE=$(_detect_adf_source duplex); fi
     if [[ -n "$SCAN_SOURCE" ]]; then
-      info "Source chargeur détectée : ${SCAN_SOURCE}"
+      info "Recto verso : source « ${SCAN_SOURCE} »."
     else
-      warn "Aucune source « ADF » détectée : le scanner utilisera sa source par défaut."
-      echo -e "    ${DIM}Pour la forcer : -S \"<source>\" (voir -D).${RESET}"
+      if $DUPLEX && $CAPS_OK; then
+        warn "Ce scanner ne propose pas de source recto verso : seul le recto sera scanné."
+      fi
+      SCAN_SOURCE=$(_detect_adf_source)
+      if [[ -n "$SCAN_SOURCE" ]]; then
+        info "Source chargeur détectée : ${SCAN_SOURCE}"
+      else
+        warn "Aucune source « ADF » détectée : le scanner utilisera sa source par défaut."
+        echo -e "    ${DIM}Pour la forcer : -S \"<source>\" (voir -D).${RESET}"
+      fi
     fi
   fi
 
@@ -1365,6 +1396,7 @@ run_diagnostic() {
     v=$(_cap_values "--source") || v="—"
     _diag_row "Sources :" "${v//|/, }"
     v=$(_detect_adf_source); _diag_row "Chargeur (-a) :" "${v:-aucun détecté}"
+    v=$(_detect_adf_source duplex); _diag_row "Recto verso (-2) :" "${v:-non proposé}"
     if v=$(_cap_values "--mode"); then
       _diag_row "Modes :" "${v//|/, }"
       local c g

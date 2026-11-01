@@ -114,6 +114,7 @@ The script guides you step by step:
 | `-p` | Multi-page mode | — |
 | `-n <nb>` | Number of pages (enables multi-page mode if > 1) | `1` |
 | `-a` | Automatic document feeder (ADF): scan the whole tray at once | — |
+| `-2`, `--recto-verso` | Double-sided with the feeder: both sides of each sheet become pages (implies `-a`) | — |
 | `-S <source>` | Explicit SANE source (`ADF`, `ADF Duplex`, `Flatbed`…, see `scanimage -A`) | auto-detected with `-a` |
 | `-R` | Enable OCR | — |
 | `-L <lang>` | OCR language (`fra`, `eng`, `fra+eng`…) | `fra+eng` |
@@ -158,6 +159,7 @@ In interactive mode, paths accept `~` and drag-and-drop from a file manager (quo
 
 # Every page in the automatic document feeder, black & white
 ./scandoc.sh -a -m bw -o letter.pdf
+./scandoc.sh --recto-verso -o double_sided.pdf
 
 # PDF with French OCR and metadata stripped
 ./scandoc.sh -R -L fra -M -o document_ocr.pdf
@@ -224,6 +226,8 @@ Each driver names its settings its own way. Before scanning, the script reads th
 - **Resolution**: rounded to the nearest accepted value (e.g. 250 dpi → 300 dpi if the scanner only offers 200 and 300).
 - **Paper format**: limited to the scanner's maximum area (e.g. Legal on an A4 flatbed).
 - **Feeder (`-a`)**: the "ADF" / "Feeder" source is found among the scanner's sources.
+- **Double-sided (`-2`)**: the feeder's duplex source (`Duplex ADF`, `ADF Duplex`…) is picked automatically; in interactive mode the feeder menu asks the question. Without a duplex source, only the front side is scanned (with a warning).
+- **Sheetfed scanner (no flatbed)**: a single scan uses the single-sided feeder.
 - **Several scanners**: in interactive mode the script asks which one to use; on the command line it takes the first and shows how to pick another with `-d`. Webcams are ignored.
 
 Each adjustment is reported with a warning. If the scanner's options cannot be read, the standard settings (`Color`/`Gray`) are used.
