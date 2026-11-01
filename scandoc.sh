@@ -1262,6 +1262,28 @@ _adapt_to_caps() {
   SCAN_SIZE_OPTS=("-x" "$w" "-y" "$h")
 }
 
+# Message d'erreur de scanimage sans les lignes de progression ni les
+# avertissements sans conséquence (« rounded value of br-y… »)
+_scan_error_text() {
+  grep -v -e '^Scanning' -e '^Scanned' -e 'rounded value of' "$1" || true
+}
+
+# Conseil adapté à l'erreur de scanimage ($1), sinon le conseil par défaut ($2)
+_scan_error_hint() {
+  local low="${1,,}"
+  if [[ "$low" =~ (out\ of\ documents|no\ more\ documents|no\ documents|feeder) ]]; then
+    echo "Le bac du chargeur est vide : placez la feuille dans le bac, puis relancez."
+  elif [[ "$low" =~ (jammed|jam) ]]; then
+    echo "Bourrage papier : dégagez la feuille, puis relancez."
+  elif [[ "$low" =~ (busy|in\ use) ]]; then
+    echo "Le scanner est occupé (autre logiciel ouvert ?) : fermez-le, puis relancez."
+  elif [[ "$low" =~ (invalid\ argument) ]]; then
+    echo "Le scanner refuse un réglage : voir ce qu'il accepte avec -D."
+  else
+    echo "$2"
+  fi
+}
+
 # Avant le premier scan : choix du scanner, source du chargeur, puis adaptation
 # des réglages à ce que le scanner accepte.
 prepare_scanner() {
@@ -1275,6 +1297,20 @@ prepare_scanner() {
     else
       warn "Aucune source « ADF » détectée : le scanner utilisera sa source par défaut."
       echo -e "    ${DIM}Pour la forcer : -S \"<source>\" (voir -D).${RESET}"
+    fi
+  fi
+
+  # Scanner sans vitre (à défilement) et aucune source imposée : pour une page à
+  # la fois, le chargeur en recto simple plutôt que la source par défaut du
+  # pilote (souvent le recto verso)
+  if [[ -z "$SCAN_SOURCE" ]]; then
+    _load_caps
+    local sources
+    if sources=$(_cap_values "--source") && [[ ! "${sources,,}" =~ (flatbed|platen|glass) ]]; then
+      SCAN_SOURCE=$(_detect_adf_source)
+      if [[ -n "$SCAN_SOURCE" ]]; then
+        info "Scanner sans vitre : source « ${SCAN_SOURCE} » (placez la feuille dans le bac)."
+      fi
     fi
   fi
 
@@ -1440,9 +1476,9 @@ do_scan() {
   scan_err=$(mktemp)
   if ! scanimage "${SCAN_OPTS[@]}" > "$outfile" 2>"$scan_err"; then
     local msg
-    msg=$(cat "$scan_err")
+    msg=$(_scan_error_text "$scan_err")
     rm -f "$scan_err"
-    error "Échec du scan : ${msg:-erreur inconnue}\n  → Vérifiez que le document est chargé et le scanner prêt."
+    error "Échec du scan : ${msg:-erreur inconnue}\n  → $(_scan_error_hint "$msg" "Vérifiez que le document est chargé et le scanner prêt.")"
   fi
   rm -f "$scan_err"
 
@@ -1476,7 +1512,7 @@ do_scan_adf() {
   for f in "${raw[@]}"; do [[ -s "$f" ]] && pages_ok+=("$f"); done
 
   if [[ ${#pages_ok[@]} -eq 0 ]]; then
-    local msg; msg=$(grep -v '^Scanning\|^Scanned' "$scan_err" || true)
+    local msg; msg=$(_scan_error_text "$scan_err")
     rm -f "$scan_err"
     error "Aucune page scannée depuis le chargeur : ${msg:-erreur inconnue}\n  → Vérifiez que les pages sont dans le bac et que le scanner a un chargeur (-S pour choisir la source)."
   fi
