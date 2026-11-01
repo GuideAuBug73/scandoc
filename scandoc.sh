@@ -43,7 +43,7 @@ PAPER_FORMAT="auto"      # Format papier : auto, A4, A5, Letter, Legal, custom
 OUTPUT=""               # Fichier de sortie (auto-généré si vide)
 INPUT_FILE=""           # Fichier source existant (bypass le scan)
 THRESHOLD=55            # Seuil de binarisation pour le mode bw (0-100)
-WHITE_THRESH=75         # Seuil de blanchiment pour le mode clean (0-100)
+WHITE_THRESH=60         # Seuil de blanchiment pour le mode clean (0-100, plus bas = plus blanc)
 BLUR=0                  # Rayon de flou avant traitement (0=désactivé)
 DEVICE=""               # Scanner SANE (auto-détecté si vide)
 MULTI_PAGE=false        # Scan multi-pages avec pause entre chaque page
@@ -532,7 +532,7 @@ menu_advanced() {
     clean)
       echo -e "  ${BOLD}Seuil de blanchiment${RESET}  ${DIM}(mode clean)${RESET}"
       echo -e "  ${DIM}Les pixels plus clairs que ce seuil sont forcés en blanc pur.${RESET}"
-      echo -e "  ${DIM}  ↑ Monter si le fond gris persiste   ↓ Descendre si les couleurs s'effacent${RESET}"
+      echo -e "  ${DIM}  ↓ Descendre si le fond gris persiste   ↑ Monter si le texte pâle ou les couleurs s'effacent${RESET}"
       ask_int "Seuil (0-100)" "$WHITE_THRESH" 0 100
       WHITE_THRESH="$REPLY"
       echo ""
@@ -824,7 +824,7 @@ ${BOLD}OPTIONS${RESET}
   -o <fichier>   Fichier PDF de sortie (défaut: scan_YYYYMMDD_HHMMSS.pdf)
   -f <fichier>   Fichier source existant (skip le scan)
   -t <0-100>     Seuil binarisation mode bw (défaut: ${THRESHOLD})
-  -w <0-100>     Seuil blanchiment mode clean (défaut: ${WHITE_THRESH})
+  -w <0-100>     Seuil blanchiment mode clean (défaut: ${WHITE_THRESH}) — plus bas = plus blanc
   -b <0-3>       Rayon de flou anti-bruit (défaut: ${BLUR}, 0=désactivé)
   -d <device>    Device SANE (défaut: auto-détection)
   -F <format>    Format papier : auto, A4, A5, Letter, Legal, WxH (mm) (défaut: auto)

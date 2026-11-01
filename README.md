@@ -120,7 +120,7 @@ The script guides you step by step:
 | `-L <lang>` | OCR language (`fra`, `eng`, `fra+eng`…) | `fra+eng` |
 | `-M` | Strip all metadata | — |
 | `-t <0-100>` | Binarisation threshold (mode `bw`) | `55` |
-| `-w <0-100>` | Whitening threshold (mode `clean`) | `75` |
+| `-w <0-100>` | Whitening threshold (mode `clean`), lower = whiter | `60` |
 | `-b <0-3>` | Noise-reduction blur radius before binarisation | `0` |
 | `-C` | Disable Ghostscript compression | — |
 | `-y` | Overwrite the output file if it already exists (otherwise: prompt, or error outside a terminal) | — |

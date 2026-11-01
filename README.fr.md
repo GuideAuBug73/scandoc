@@ -120,7 +120,7 @@ Le script guide étape par étape :
 | `-L <lang>` | Langue OCR (`fra`, `eng`, `fra+eng`…) | `fra+eng` |
 | `-M` | Supprimer toutes les métadonnées | — |
 | `-t <0-100>` | Seuil de binarisation (mode `bw`) | `55` |
-| `-w <0-100>` | Seuil de blanchiment (mode `clean`) | `75` |
+| `-w <0-100>` | Seuil de blanchiment (mode `clean`), plus bas = plus blanc | `60` |
 | `-b <0-3>` | Flou anti-bruit avant binarisation | `0` |
 | `-C` | Désactiver la compression Ghostscript | — |
 | `-y` | Écraser le fichier de sortie s'il existe déjà (sinon : question, ou erreur hors terminal) | — |
