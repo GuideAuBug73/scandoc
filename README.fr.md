@@ -81,8 +81,8 @@ sudo ln -s "$PWD/scandoc.sh" /usr/local/bin/scandoc
 
 Le script guide étape par étape :
 
-1. Choix de l'action (scan simple / fichier existant / multi-pages / lister les scanners)
-2. Sélection du scanner (auto-détection ou saisie manuelle)
+1. Choix de l'action (scan simple / fichier existant / multi-pages / diagnostic des scanners)
+2. Sélection du scanner (auto-détection, choix dans la liste ou saisie manuelle)
 3. Format papier
 4. Résolution
 5. Mode de traitement
@@ -126,6 +126,7 @@ Le script guide étape par étape :
 | `-V` | Ouvrir le fichier produit à la fin (`xdg-open`) | — |
 | `-k` | Garder les fichiers temporaires (debug) | — |
 | `-l` | Lister les scanners disponibles | — |
+| `-D`, `--diagnostic` | Afficher ce que chaque scanner accepte (sources, modes, résolutions, zone) | — |
 | `-h` | Afficher l'aide | — |
 
 ---
@@ -230,16 +231,27 @@ Les PDF et JPEG produits contiennent par défaut des métadonnées révélant le
 
 ## Compatibilité scanner
 
-Le script utilise SANE (`scanimage`) et est compatible avec tous les scanners supportés par SANE sous Linux : Brother, Epson, Canon, HP, Fujitsu, Plustek, etc.
+Le script passe par SANE (`scanimage`) : il marche avec tous les scanners pris en charge par SANE sous Linux (Brother, Epson, Canon, HP, Fujitsu, Plustek…), y compris la plupart des scanners réseau ou récents sans pilote grâce à [`sane-airscan`](https://github.com/alexpevzner/sane-airscan) (`sudo apt install sane-airscan`).
 
-Pour trouver l'identifiant de votre scanner :
+Chaque pilote nomme ses réglages à sa façon. Avant de scanner, le script lit une fois les options du scanner (`scanimage -A`) et s'adapte :
+
+- **Mode couleur** : le nom attendu par le pilote est choisi automatiquement (`Color`, `Colour`, `24bit Color`… / `Gray`, `Grayscale`, `True Gray`…).
+- **Résolution** : arrondie à la valeur acceptée la plus proche (ex. 250 dpi → 300 dpi si le scanner ne propose que 200 et 300).
+- **Format papier** : limité à la zone maximale du scanner (ex. Legal sur une vitre A4).
+- **Chargeur (`-a`)** : la source « ADF » / « Feeder » est trouvée parmi celles du scanner.
+- **Plusieurs scanners** : en mode interactif, le script demande lequel utiliser ; en ligne de commande, il prend le premier et indique comment choisir les autres avec `-d`. Les webcams sont ignorées.
+
+Chaque ajustement est signalé par un avertissement. Si les options du scanner ne peuvent pas être lues, les réglages standard (`Color`/`Gray`) sont utilisés.
+
+Pour voir les scanners détectés et ce que chacun accepte :
 ```bash
-./scandoc.sh -l
-# ou
-scanimage -L
+./scandoc.sh -l            # liste rapide
+./scandoc.sh --diagnostic  # détail : sources, modes, résolutions, zone maximale
 ```
 
-Les backends testés : `dsseries` (Brother DS-720D). Les options utilisées (`--mode`, `--resolution`, `-x`, `-y`, `--format=pnm`) sont standard et supportées par la quasi-totalité des backends modernes.
+Les pilotes propriétaires de certains fabricants (Brother `brscan`, Epson Image Scan…) sont à installer séparément, depuis le site du fabricant.
+
+Backends testés : `dsseries` (Brother DS-720D).
 
 ---
 

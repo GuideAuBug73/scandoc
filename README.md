@@ -81,8 +81,8 @@ sudo ln -s "$PWD/scandoc.sh" /usr/local/bin/scandoc
 
 The script guides you step by step:
 
-1. Choose action (single scan / existing file / multi-page / list scanners)
-2. Select scanner (auto-detect or enter manually)
+1. Choose action (single scan / existing file / multi-page / scanner diagnostics)
+2. Select scanner (auto-detect, pick from the list or enter manually)
 3. Paper format
 4. Resolution
 5. Processing mode
@@ -126,6 +126,7 @@ The script guides you step by step:
 | `-V` | Open the resulting file at the end (`xdg-open`) | — |
 | `-k` | Keep temporary files (debug) | — |
 | `-l` | List available scanners | — |
+| `-D`, `--diagnostic` | Show what each scanner accepts (sources, modes, resolutions, area) | — |
 | `-h` | Show help | — |
 
 ---
@@ -215,16 +216,27 @@ PDF and JPEG files produced by the script contain metadata by default, revealing
 
 ## Scanner Compatibility
 
-The script uses SANE (`scanimage`) and is compatible with all SANE-supported scanners on Linux: Brother, Epson, Canon, HP, Fujitsu, Plustek, etc.
+The script goes through SANE (`scanimage`): it works with every scanner SANE supports on Linux (Brother, Epson, Canon, HP, Fujitsu, Plustek…), including most network or recent scanners without a driver thanks to [`sane-airscan`](https://github.com/alexpevzner/sane-airscan) (`sudo apt install sane-airscan`).
 
-To find your scanner's device ID:
+Each driver names its settings its own way. Before scanning, the script reads the scanner's options once (`scanimage -A`) and adapts:
+
+- **Color mode**: the name the driver expects is picked automatically (`Color`, `Colour`, `24bit Color`… / `Gray`, `Grayscale`, `True Gray`…).
+- **Resolution**: rounded to the nearest accepted value (e.g. 250 dpi → 300 dpi if the scanner only offers 200 and 300).
+- **Paper format**: limited to the scanner's maximum area (e.g. Legal on an A4 flatbed).
+- **Feeder (`-a`)**: the "ADF" / "Feeder" source is found among the scanner's sources.
+- **Several scanners**: in interactive mode the script asks which one to use; on the command line it takes the first and shows how to pick another with `-d`. Webcams are ignored.
+
+Each adjustment is reported with a warning. If the scanner's options cannot be read, the standard settings (`Color`/`Gray`) are used.
+
+To see detected scanners and what each one accepts:
 ```bash
-./scandoc.sh -l
-# or
-scanimage -L
+./scandoc.sh -l            # quick list
+./scandoc.sh --diagnostic  # details: sources, modes, resolutions, maximum area
 ```
 
-Tested backends: `dsseries` (Brother DS-720D). The options used (`--mode`, `--resolution`, `-x`, `-y`, `--format=pnm`) are standard and supported by the vast majority of modern backends.
+Some manufacturers' proprietary drivers (Brother `brscan`, Epson Image Scan…) must be installed separately, from the manufacturer's website.
+
+Tested backends: `dsseries` (Brother DS-720D).
 
 ---
 
